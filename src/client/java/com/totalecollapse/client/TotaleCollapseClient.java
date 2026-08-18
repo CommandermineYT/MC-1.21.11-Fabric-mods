@@ -6,7 +6,6 @@ import java.util.List;
 import java.util.Random; // Import Random
 
 import net.fabricmc.api.ClientModInitializer;
-import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.core.particles.ParticleTypes;
@@ -26,9 +25,7 @@ public class TotaleCollapseClient implements ClientModInitializer {
 
     @Override
     public void onInitializeClient() {
-        ClientTickEvents.END_CLIENT_TICK.register(TotaleCollapseClient::tickMeteors);
-        // Call createMeteorShower here to ensure it's used
-        createMeteorShower();
+        
     }
 
     private static void createMeteorShower() { // This method is now used
