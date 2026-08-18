@@ -1,0 +1,27 @@
+{
+  "stats": {
+    "minecraft:dropped": {
+      "minecraft:magma_block": 1
+    },
+    "minecraft:used": {
+      "minecraft:magma_block": 101
+    },
+    "minecraft:picked_up": {
+      "minecraft:magma_block": 1
+    },
+    "minecraft:custom": {
+      "minecraft:time_since_rest": 8523,
+      "minecraft:walk_one_cm": 678,
+      "minecraft:total_world_time": 8540,
+      "minecraft:leave_game": 1,
+      "minecraft:fly_one_cm": 40626,
+      "minecraft:crouch_one_cm": 34,
+      "minecraft:sneak_time": 225,
+      "minecraft:play_time": 8523,
+      "minecraft:jump": 8,
+      "minecraft:time_since_death": 8523,
+      "minecraft:drop": 1
+    }
+  },
+  "DataVersion": 4671
+}

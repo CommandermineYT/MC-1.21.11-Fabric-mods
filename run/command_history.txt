@@ -1,0 +1,15 @@
+/collapse
+/totalecollapse meteor
+/tick freeze
+/totalecollapse meteor
+/tick unfreeze
+/totalecollapse meteor
+/tick freeze
+/tick unfreeze
+/collapse meteor
+/tick freeze
+/tick unfreeze
+/collapse meteor
+/tick freeze
+/tick unfreeze
+/collapse meteor
