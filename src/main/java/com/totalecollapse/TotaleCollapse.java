@@ -207,7 +207,7 @@ public class TotaleCollapse implements ModInitializer {
 
                                 if (!(lvlObj instanceof ServerLevel)) return;
                                 ServerLevel level = (ServerLevel) lvlObj;
-                                LightningStrikeBackend.triggerLightning(level, new Vec3(x, y, z));
+                                LightningStrike.triggerLightning(level, new Vec3(x, y, z));
                             } catch (Throwable t) {
                                 LOGGER.error("Error handling lightning request", t);
                             }
@@ -295,7 +295,7 @@ public class TotaleCollapse implements ModInitializer {
                 double x = origin.x + Math.cos(angle) * distance;
                 double z = origin.z + Math.sin(angle) * distance;
 
-                LightningStrikeBackend.triggerLightning(level, new Vec3(x, origin.y, z));
+                LightningStrike.triggerLightning(level, new Vec3(x, origin.y, z));
             }
 
             LOGGER.info("Lightning storm summoned at {}", origin);
@@ -544,9 +544,9 @@ double radius = meteorSize / 2.0;
     int meteorSize
 ) {
     float explosionPower = switch (meteorSize) {
-        case 3 -> 4.0F;
-        case 5 -> 6.0F;
-        case 9 -> 10.0F;
+        case 3 -> 5.0F;
+        case 5 -> 7.0F;
+        case 9 -> 12.0F;
         default -> 6.0F;
     };
 
