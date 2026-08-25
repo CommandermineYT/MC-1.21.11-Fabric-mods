@@ -25,9 +25,6 @@ import net.minecraft.server.level.ServerLevel;
 import java.util.Map;
 import java.util.HashMap;
 import java.util.UUID;
-import net.minecraft.world.entity.EntitySpawnReason;
-import net.minecraft.world.entity.EntityType;
-import net.minecraft.world.entity.LightningBolt;
 import net.minecraft.world.entity.item.FallingBlockEntity;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
@@ -46,11 +43,11 @@ public class TotaleCollapse implements ModInitializer {
     private static final double MIN_SPAWN_HEIGHT = 30.0;
     private static final double MAX_SPAWN_HEIGHT = 60.0;
 
-    private static final double MIN_TARGET_RADIUS = 18.0;
-    private static final double MAX_TARGET_RADIUS = 70.0;
+    private static final double MIN_TARGET_RADIUS = 25.0;
+    private static final double MAX_TARGET_RADIUS = 150.0;
 
-    private static final double MIN_ANGLE_DEGREES = 40.0;
-    private static final double MAX_ANGLE_DEGREES = 50.0;
+    private static final double MIN_ANGLE_DEGREES = 35.0;
+    private static final double MAX_ANGLE_DEGREES = 65.0;
     private static final double SPEED = 0.75;
 
     private static final Random RANDOM = new Random();
@@ -210,18 +207,7 @@ public class TotaleCollapse implements ModInitializer {
 
                                 if (!(lvlObj instanceof ServerLevel)) return;
                                 ServerLevel level = (ServerLevel) lvlObj;
-                                BlockPos pos = BlockPos.containing(x, y, z);
-                                LightningBolt bolt = EntityType.LIGHTNING_BOLT.create(
-                                    level,
-                                    null,
-                                    pos,
-                                    EntitySpawnReason.COMMAND,
-                                    true,
-                                    false
-                                );
-                                if (bolt != null) {
-                                    level.addFreshEntity(bolt);
-                                }
+                                LightningStrikeBackend.triggerLightning(level, new Vec3(x, y, z));
                             } catch (Throwable t) {
                                 LOGGER.error("Error handling lightning request", t);
                             }
@@ -309,20 +295,7 @@ public class TotaleCollapse implements ModInitializer {
                 double x = origin.x + Math.cos(angle) * distance;
                 double z = origin.z + Math.sin(angle) * distance;
 
-                BlockPos pos = BlockPos.containing(x, origin.y, z);
-
-                LightningBolt lightning = EntityType.LIGHTNING_BOLT.create(
-                    level,
-                    null,
-                    pos,
-                    EntitySpawnReason.COMMAND,
-                    true,
-                    false
-                );
-
-                if (lightning != null) {
-                    level.addFreshEntity(lightning);
-                }
+                LightningStrikeBackend.triggerLightning(level, new Vec3(x, origin.y, z));
             }
 
             LOGGER.info("Lightning storm summoned at {}", origin);
@@ -350,11 +323,21 @@ public class TotaleCollapse implements ModInitializer {
                                 return Command.SINGLE_SUCCESS;
                             })
                     )
+                    .then(
+                        Commands.literal("earth")
+                            .executes(context -> {
+                                ServerLevel level = context.getSource().getLevel();
+                                Vec3 origin = context.getSource().getPosition();
+
+                                EarthWave.triggerEarthWave(level, origin);
+
+                                LOGGER.info("Earth shockwave cast at {}", origin);
+
+                                return Command.SINGLE_SUCCESS;
+                            })
+                    )
             );
         });
-        
-
-        
 
         ServerTickEvents.END_SERVER_TICK.register(server -> tickMeteors());
     }
@@ -475,9 +458,9 @@ double radius = meteorSize / 2.0;
 }
 
         ACTIVE_METEORS.add(
-            new MeteorGroup(level, blocks, groupCenter)
-        );
-    }
+    new MeteorGroup(level, blocks, groupCenter, meteorSize)
+    ); 
+} 
 
     private static void tickMeteorGroups() {
         Iterator<MeteorGroup> iterator = ACTIVE_METEORS.iterator();
@@ -512,7 +495,11 @@ double radius = meteorSize / 2.0;
 }
 
             if (!anyBlockIsAlive) {
-    createMeteorCrater(group.level, group.lastKnownPosition);
+    createMeteorCrater(
+    group.level,
+    group.lastKnownPosition,
+    group.meteorSize
+);
     spawnImpactBurst(group.level, group.lastKnownPosition);
 
     iterator.remove();
@@ -551,8 +538,17 @@ double radius = meteorSize / 2.0;
         );
     }
 
-    private static void createMeteorCrater(ServerLevel level, Vec3 position) {
-    float explosionPower = 6.0F;
+    private static void createMeteorCrater(
+    ServerLevel level,
+    Vec3 position,
+    int meteorSize
+) {
+    float explosionPower = switch (meteorSize) {
+        case 3 -> 4.0F;
+        case 5 -> 6.0F;
+        case 9 -> 10.0F;
+        default -> 6.0F;
+    };
 
     level.explode(
         null,
@@ -608,20 +604,23 @@ double radius = meteorSize / 2.0;
     }
 
     private static final class MeteorGroup {
-        private final ServerLevel level;
-        private final List<FallingBlockEntity> blocks;
-        private Vec3 lastKnownPosition;
+    private final ServerLevel level;
+    private final List<FallingBlockEntity> blocks;
+    private Vec3 lastKnownPosition;
+    private final int meteorSize;
 
-        private MeteorGroup(
-            ServerLevel level,
-            List<FallingBlockEntity> blocks,
-            Vec3 lastKnownPosition
-        ) {
-            this.level = level;
-            this.blocks = blocks;
-            this.lastKnownPosition = lastKnownPosition;
-        }
+    private MeteorGroup(
+        ServerLevel level,
+        List<FallingBlockEntity> blocks,
+        Vec3 lastKnownPosition,
+        int meteorSize
+    ) {
+        this.level = level;
+        this.blocks = blocks;
+        this.lastKnownPosition = lastKnownPosition;
+        this.meteorSize = meteorSize;
     }
+}
 
     private static final class MeteorStorm {
         private final ServerLevel level;
