@@ -1,13 +1,9 @@
 package com.totalecollapse;
 
-import java.lang.reflect.InvocationTargetException;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
-import java.util.Map;
 import java.util.Random;
-import java.util.UUID;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -21,12 +17,10 @@ import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.event.player.UseEntityCallback;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
-import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.minecraft.commands.Commands;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.particles.BlockParticleOption;
 import net.minecraft.core.particles.ParticleTypes;
-import net.minecraft.resources.Identifier;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.InteractionHand;
@@ -39,7 +33,6 @@ import net.minecraft.world.phys.Vec3;
 public class TotaleCollapse implements ModInitializer {
 
     public static final String MOD_ID = "totale-collapse";
-    public static final Identifier LIGHTNING_PACKET = Identifier.fromNamespaceAndPath(MOD_ID, "lightning_request");
     public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
 
     private static final int GROUPS_PER_STORM = 12;
@@ -60,275 +53,26 @@ public class TotaleCollapse implements ModInitializer {
     private static final Random RANDOM = new Random();
     private static final List<MeteorGroup> ACTIVE_METEORS = new ArrayList<>();
     private static final List<MeteorStorm> ACTIVE_STORMS = new ArrayList<>();
-    private static final Map<UUID, Long> LAST_LIGHTNING_TIME = new HashMap<>();
-    private static final long LIGHTNING_COOLDOWN_MS = 2000L;
-    private static final double LIGHTNING_MAX_DISTANCE_SQ = 100.0 * 100.0; // 100 blocks
 
     @Override
     public void onInitialize() {
-        try {
-            Class<?> spnClass = ServerPlayNetworking.class;
-            java.lang.reflect.Method[] methods = spnClass.getMethods();
-            java.lang.reflect.Method target = null;
-            for (java.lang.reflect.Method m : methods) {
-                if (!m.getName().equals("registerGlobalReceiver")) {
-                    continue;
-                }
-                Class<?>[] pts = m.getParameterTypes();
-                if (pts.length == 2) {
-                    target = m;
-                    break;
-                }
+        UseEntityCallback.EVENT.register((player, world, hand, entity, hitResult) -> {
+            if (world.isClientSide() || hand != InteractionHand.MAIN_HAND) {
+                return InteractionResult.PASS;
+            }
+            if (!(player instanceof ServerPlayer serverPlayer) || !MindControlManager.isAwaitingTarget(serverPlayer)) {
+                return InteractionResult.PASS;
             }
 
-            UseEntityCallback.EVENT.register((player, world, hand, entity, hitResult) -> {
-    if (world.isClientSide() || hand != InteractionHand.MAIN_HAND) {
-        return InteractionResult.PASS;
-    }
-    if (!(player instanceof ServerPlayer serverPlayer) || !MindControlManager.isAwaitingTarget(serverPlayer)) {
-        return InteractionResult.PASS;
-    }
+            MindControlManager.tryPossess(serverPlayer, entity);
+            return InteractionResult.SUCCESS;
+        });
 
-    MindControlManager.tryPossess(serverPlayer, entity);
-    return InteractionResult.SUCCESS;
-});
-            
-            ServerLivingEntityEvents.ALLOW_DAMAGE.register((entity, source, amount) ->
-    !(MindControlManager.isPossessedEntity(entity) && source.getEntity() instanceof Enemy));
-    
-            ServerPlayConnectionEvents.DISCONNECT.register((handler, server)
-                    -> MindControlManager.handleDisconnect(handler.getPlayer()));
-            if (target != null) {
-                ClassLoader cl = TotaleCollapse.class.getClassLoader();
-                Class<?> handlerIface = target.getParameterTypes()[1];
-                Object proxy = java.lang.reflect.Proxy.newProxyInstance(cl, new Class<?>[]{handlerIface}, (proxyObj, method, args) -> {
-                    try {
-                        net.minecraft.network.FriendlyByteBuf buf = null;
-                        net.minecraft.server.MinecraftServer server = null;
-                        Object player = null;
+        ServerLivingEntityEvents.ALLOW_DAMAGE.register((entity, source, amount) ->
+                !(MindControlManager.isPossessedEntity(entity) && source.getEntity() instanceof Enemy));
 
-                        if (args != null) {
-                            for (Object a : args) {
-                                if (a == null) {
-                                    continue;
-                                }
-                                if (a instanceof net.minecraft.network.FriendlyByteBuf friendlyByteBuf) {
-                                    buf = friendlyByteBuf;
-                                }
-                                if (a instanceof net.minecraft.server.MinecraftServer minecraftServer) {
-                                    server = minecraftServer;
-                                }
-                                if (a instanceof net.minecraft.server.level.ServerPlayer serverPlayer) {
-                                    player = serverPlayer;
-                                }
-                            }
-                        }
-
-                        if (buf == null) {
-                            // try to find a FriendlyByteBuf inside a CustomPacketPayload argument
-                            if (args != null && args.length > 0 && args[0] != null) {
-                                Object payload = args[0];
-                                try {
-                                    java.lang.reflect.Method enc = payload.getClass().getMethod("encode");
-                                    Object maybeBuf = enc.invoke(payload);
-                                    if (maybeBuf instanceof net.minecraft.network.FriendlyByteBuf friendlyByteBuf) {
-                                        buf = friendlyByteBuf;
-                                    }
-                                } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException ignore) {
-                                }
-                                // fallback: look for a field of type FriendlyByteBuf
-                                for (java.lang.reflect.Field f : payload.getClass().getDeclaredFields()) {
-                                    if (net.minecraft.network.FriendlyByteBuf.class.isAssignableFrom(f.getType())) {
-                                        f.setAccessible(true);
-                                        Object val = f.get(payload);
-                                        if (val instanceof net.minecraft.network.FriendlyByteBuf friendlyByteBuf) {
-                                            buf = friendlyByteBuf;
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        if (buf == null) {
-                            return null; // can't read payload
-                        }
-                        double x = buf.readDouble();
-                        double y = buf.readDouble();
-                        double z = buf.readDouble();
-
-                        if (server == null && player != null) {
-                            try {
-                                java.lang.reflect.Method gs = player.getClass().getMethod("getServer");
-                                Object srv = gs.invoke(player);
-                                if (srv instanceof net.minecraft.server.MinecraftServer minecraftServer) {
-                                    server = minecraftServer;
-                                }
-                            } catch (NoSuchMethodException ignore) {
-                                try {
-                                    java.lang.reflect.Field f = player.getClass().getField("server");
-                                    Object srv = f.get(player);
-                                    if (srv instanceof net.minecraft.server.MinecraftServer minecraftServer) {
-                                        server = minecraftServer;
-                                    }
-                                } catch (NoSuchFieldException | IllegalAccessException ignore2) {
-                                }
-                            } catch (IllegalAccessException | InvocationTargetException ignore) {
-                            }
-                        }
-
-                        if (server == null) {
-                            return null;
-                        }
-
-                        net.minecraft.server.MinecraftServer finalServer = server;
-                        Object finalPlayer = player;
-                        finalServer.execute(() -> {
-                            if (finalPlayer == null) {
-                                return;
-                            }
-                            try {
-                                java.lang.reflect.Method getUUID = finalPlayer.getClass().getMethod("getUUID");
-                                UUID playerId = (UUID) getUUID.invoke(finalPlayer);
-
-                                long now = System.currentTimeMillis();
-                                Long last = LAST_LIGHTNING_TIME.get(playerId);
-                                if (last != null && now - last < LIGHTNING_COOLDOWN_MS) {
-                                    String name = finalPlayer.toString();
-                                    try {
-                                        java.lang.reflect.Method gn = finalPlayer.getClass().getMethod("getName");
-                                        Object nobj = gn.invoke(finalPlayer);
-                                        name = String.valueOf(nobj);
-                                    } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException ignore) {
-                                    }
-                                    LOGGER.info("Ignoring lightning request from {} due to cooldown", name);
-                                    return;
-                                }
-
-                                Object playerPosObj = null;
-                                try {
-                                    java.lang.reflect.Method posm = finalPlayer.getClass().getMethod("position");
-                                    playerPosObj = posm.invoke(finalPlayer);
-                                } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException ignore) {
-                                }
-
-                                double px = 0.0, pz = 0.0;
-                                if (playerPosObj != null) {
-                                    try {
-                                        java.lang.reflect.Field fx = playerPosObj.getClass().getField("x");
-                                        java.lang.reflect.Field fz = playerPosObj.getClass().getField("z");
-                                        px = fx.getDouble(playerPosObj);
-                                        pz = fz.getDouble(playerPosObj);
-                                    } catch (NoSuchFieldException t) {
-                                        try {
-                                            java.lang.reflect.Method mx = playerPosObj.getClass().getMethod("x");
-                                            java.lang.reflect.Method mz = playerPosObj.getClass().getMethod("z");
-                                            px = ((Number) mx.invoke(playerPosObj)).doubleValue();
-                                            pz = ((Number) mz.invoke(playerPosObj)).doubleValue();
-                                        } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException t2) {
-                                        }
-                                    } catch (IllegalAccessException t) {
-                                    }
-                                }
-
-                                double dx = px - x;
-                                double dz = pz - z;
-                                double distSq = dx * dx + dz * dz;
-
-                                String name = finalPlayer.toString();
-                                try {
-                                    java.lang.reflect.Method gn = finalPlayer.getClass().getMethod("getName");
-                                    Object nobj = gn.invoke(finalPlayer);
-                                    name = String.valueOf(nobj);
-                                } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException ignore) {
-                                }
-
-                                if (distSq > LIGHTNING_MAX_DISTANCE_SQ) {
-                                    LOGGER.info("Ignoring lightning request from {}: target too far", name);
-                                    return;
-                                }
-
-                                try {
-                                    java.lang.reflect.Method hasPerm = finalPlayer.getClass().getMethod("hasPermissions", int.class);
-                                    Boolean allowed = (Boolean) hasPerm.invoke(finalPlayer, 2);
-                                    if (!allowed) {
-                                        LOGGER.info("Ignoring lightning request from {}: insufficient permissions", name);
-                                        return;
-                                    }
-                                } catch (NoSuchMethodException ns) {
-                                    try {
-                                        java.lang.reflect.Method hasPerm2 = finalPlayer.getClass().getMethod("hasPermission", int.class);
-                                        Boolean allowed = (Boolean) hasPerm2.invoke(finalPlayer, 2);
-                                        if (!allowed) {
-                                            LOGGER.info("Ignoring lightning request from {}: insufficient permissions", name);
-                                            return;
-                                        }
-                                    } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException ignore) {
-                                    }
-                                } catch (IllegalAccessException | InvocationTargetException ignore) {
-                                }
-
-                                LAST_LIGHTNING_TIME.put(playerId, now);
-
-                                Object lvlObj = null;
-                                try {
-                                    java.lang.reflect.Method gl = finalPlayer.getClass().getMethod("getLevel");
-                                    lvlObj = gl.invoke(finalPlayer);
-                                } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException ignore) {
-                                }
-
-                                if (lvlObj == null) {
-                                    try {
-                                        java.lang.reflect.Field lf = finalPlayer.getClass().getField("level");
-                                        lvlObj = lf.get(finalPlayer);
-                                    } catch (NoSuchFieldException | IllegalAccessException ignore) {
-                                    }
-                                }
-
-                                if (!(lvlObj instanceof ServerLevel)) {
-                                    return;
-                                }
-                                ServerLevel level = (ServerLevel) lvlObj;
-                                LightningStrike.triggerLightning(level, new Vec3(x, y, z));
-                            } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException e) {
-                                LOGGER.error("Error handling lightning request", e);
-                            }
-                        });
-                    } catch (RuntimeException t) {
-                        LOGGER.error("Error in lightning packet handler", t);
-                    }
-                    return null;
-                });
-
-                // prepare first argument matching the target parameter type
-                Object firstArg = LIGHTNING_PACKET;
-                Class<?> p0 = target.getParameterTypes()[0];
-                try {
-                    if (!p0.isInstance(LIGHTNING_PACKET)) {
-                        try {
-                            Class<?> cpp = Class.forName("net.minecraft.network.protocol.common.custom.CustomPacketPayload");
-                            java.lang.reflect.Method createType = cpp.getMethod("createType", String.class);
-                            firstArg = createType.invoke(null, LIGHTNING_PACKET.toString());
-                        } catch (ClassNotFoundException | NoSuchMethodException ignore) {
-                            // fallback: leave Identifier as-is
-                        }
-                    }
-                } catch (IllegalAccessException | InvocationTargetException e) {
-                    // ignore and fallback
-                }
-
-                // invoke registerGlobalReceiver via reflection to avoid compile-time signature mismatch
-                try {
-                    target.invoke(null, firstArg, proxy);
-                } catch (IllegalAccessException | InvocationTargetException e) {
-                    LOGGER.error("Failed to register lightning packet receiver", e);
-                }
-            } else {
-                LOGGER.error("No suitable registerGlobalReceiver overload found");
-            }
-        } catch (RuntimeException t) {
-            LOGGER.error("Failed to register lightning packet receiver", t);
-        }
+        ServerPlayConnectionEvents.DISCONNECT.register((handler, server)
+                -> MindControlManager.handleDisconnect(handler.getPlayer()));
 
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
             dispatcher.register(
@@ -380,27 +124,6 @@ public class TotaleCollapse implements ModInitializer {
                                                                 return Command.SINGLE_SUCCESS;
                                                             })
                                             )
-                            )
-                            .then(
-                                    Commands.literal("lightning")
-                                            .executes(context -> {
-                                                ServerLevel level = context.getSource().getLevel();
-                                                Vec3 origin = context.getSource().getPosition();
-
-                                                for (int i = 0; i < 6; i++) {
-                                                    double angle = RANDOM.nextDouble() * Math.PI * 2.0;
-                                                    double distance = 2.0 + RANDOM.nextDouble() * 10.0;
-
-                                                    double x = origin.x + Math.cos(angle) * distance;
-                                                    double z = origin.z + Math.sin(angle) * distance;
-
-                                                    LightningStrike.triggerLightning(level, new Vec3(x, origin.y, z));
-                                                }
-
-                                                LOGGER.info("Lightning storm summoned at {}", origin);
-
-                                                return Command.SINGLE_SUCCESS;
-                                            })
                             )
                             .then(
                                     Commands.literal("meteor")
@@ -545,69 +268,73 @@ public class TotaleCollapse implements ModInitializer {
         ACTIVE_METEORS.add(new MeteorGroup(level, blocks, groupCenter, meteorSize));
     }
 
-    private static void tickMeteorGroups() {
-        Iterator<MeteorGroup> iterator = ACTIVE_METEORS.iterator();
+    private static final int MAX_GROUP_LIFETIME_TICKS = 600;
 
-        while (iterator.hasNext()) {
-            MeteorGroup group = iterator.next();
-            Vec3 trailPosition = null;
-            boolean anyBlockIsAlive = false;
+private static void tickMeteorGroups() {
+    Iterator<MeteorGroup> iterator = ACTIVE_METEORS.iterator();
 
-            Vec3 totalPosition = Vec3.ZERO;
-            int aliveCount = 0;
+    while (iterator.hasNext()) {
+        MeteorGroup group = iterator.next();
 
-            for (FallingBlockEntity meteor : group.blocks) {
-                if (!meteor.isAlive()) {
-                    continue;
-                }
+        // Undo anything vanilla placed during its own entity tick.
+        for (FallingBlockEntity meteor : group.blocks) {
+            clearMeteorBlock(group.level, meteor);
+        }
 
-                Vec3 meteorPosition = meteor.position();
-                totalPosition = totalPosition.add(meteorPosition);
-                aliveCount++;
+        group.age++;
 
-                BlockPos blockBelow = BlockPos.containing(
-                        meteorPosition.x,
-                        meteorPosition.y - 0.6,
-                        meteorPosition.z
-                );
+        Vec3 sum = Vec3.ZERO;
+        int alive = 0;
+        Vec3 contact = null;
 
-                if (!group.level.getBlockState(blockBelow).isAir()) {
-                    group.lastKnownPosition = meteorPosition;
-                    clearMeteorBlock(group.level, meteor);
-                    meteor.discard();
-                    continue;
-                }
-
-                anyBlockIsAlive = true;
-                trailPosition = meteorPosition;
-
-                sendTrailParticles(group.level, trailPosition);
-            }
-
-            if (aliveCount > 0) {
-                group.lastKnownPosition = totalPosition.scale(1.0 / aliveCount);
-            }
-
-            if (!anyBlockIsAlive) {
-                discardRemainingBlocks(group);
-
-                createMeteorCrater(
-                        group.level,
-                        group.lastKnownPosition,
-                        group.meteorSize
-                );
-
-                spawnImpactBurst(group.level, group.lastKnownPosition);
-
-                iterator.remove();
+        for (FallingBlockEntity meteor : group.blocks) {
+            if (!meteor.isAlive()) {
                 continue;
             }
 
-            if (trailPosition != null) {
-                group.lastKnownPosition = trailPosition;
+            Vec3 pos = meteor.position();
+            sum = sum.add(pos);
+            alive++;
+
+            if (contact == null && willHitSomething(group.level, meteor)) {
+                contact = pos;
             }
         }
+
+        if (alive > 0) {
+            group.lastKnownPosition = sum.scale(1.0 / alive);
+            sendGroupTrail(group, alive);
+        }
+
+        boolean lostToVoid = group.lastKnownPosition.y < group.level.getMinY() + 2;
+
+        if (contact != null || alive == 0 || lostToVoid || group.age > MAX_GROUP_LIFETIME_TICKS) {
+            Vec3 impact = contact != null ? contact : group.lastKnownPosition;
+
+            discardRemainingBlocks(group);
+
+            if (!lostToVoid) {
+                createMeteorCrater(group.level, impact, group.meteorSize);
+                spawnImpactBurst(group.level, impact);
+            }
+
+            iterator.remove();
+        }
     }
+}
+
+private static boolean willHitSomething(ServerLevel level, FallingBlockEntity meteor) {
+    if (meteor.onGround()) {
+        return true;
+    }
+
+    Vec3 next = meteor.position().add(meteor.getDeltaMovement());
+
+    BlockPos ahead = BlockPos.containing(next.x, next.y, next.z);
+    BlockPos below = BlockPos.containing(next.x, next.y - 0.5, next.z);
+
+    return !level.getBlockState(ahead).isAir() || !level.getBlockState(below).isAir();
+}
 
     private static void discardRemainingBlocks(MeteorGroup group) {
         for (FallingBlockEntity meteor : group.blocks) {
@@ -622,6 +349,23 @@ public class TotaleCollapse implements ModInitializer {
         BlockPos pos = meteor.blockPosition();
         if (level.getBlockState(pos).is(Blocks.MAGMA_BLOCK)) {
             level.setBlock(pos, Blocks.AIR.defaultBlockState(), 3);
+        }
+    }
+
+     private static void sendGroupTrail(MeteorGroup group, int aliveCount) {
+        int step = Math.max(1, aliveCount / 8);
+        int index = 0;
+
+        for (FallingBlockEntity meteor : group.blocks) {
+            if (!meteor.isAlive()) {
+                continue;
+            }
+
+            if (index++ % step != 0) {
+                continue;
+            }
+
+            sendTrailParticles(group.level, meteor.position());
         }
     }
 
@@ -650,6 +394,8 @@ public class TotaleCollapse implements ModInitializer {
                 0.02
         );
     }
+
+   
 
     private static void createMeteorCrater(
             ServerLevel level,
@@ -726,6 +472,7 @@ public class TotaleCollapse implements ModInitializer {
         private final List<FallingBlockEntity> blocks;
         private Vec3 lastKnownPosition;
         private final int meteorSize;
+        private int age;
 
         private MeteorGroup(
                 ServerLevel level,
@@ -737,6 +484,7 @@ public class TotaleCollapse implements ModInitializer {
             this.blocks = blocks;
             this.lastKnownPosition = lastKnownPosition;
             this.meteorSize = meteorSize;
+            this.age = 0;
         }
     }
 

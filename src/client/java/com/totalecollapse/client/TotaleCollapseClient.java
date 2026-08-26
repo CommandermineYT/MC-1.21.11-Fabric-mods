@@ -3,14 +3,26 @@ package com.totalecollapse.client;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Random;
 
 import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.message.v1.ClientSendMessageEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
+import net.fabricmc.fabric.api.event.player.UseBlockCallback;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.renderer.LevelRenderer;
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.particles.ParticleTypes;
+import net.minecraft.network.chat.Component;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.InteractionResult;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.Vec3;
+import com.mojang.blaze3d.vertex.PoseStack;
 
 /**
  * Client-side initializer for the Totale Collapse mod.
@@ -18,6 +30,11 @@ import net.minecraft.world.phys.Vec3;
  * particle effect that can be triggered around the player.
  */
 public class TotaleCollapseClient implements ClientModInitializer {
+
+    private static final String PRINTER_PREFIX = "#PrinterV2";
+    private static boolean selectionMode = false;
+    private static BlockPos pos1 = null;
+    private static BlockPos pos2 = null;
 
     // ---- Meteor shower tuning ----
     private static final int METEOR_COUNT = 35;
@@ -40,26 +57,107 @@ public class TotaleCollapseClient implements ClientModInitializer {
     /** Set true to spawn a fresh burst of meteors on the next tick. */
     private static boolean showerQueued = false;
 
-@Override
-public void onInitializeClient() {
-    HudRenderCallback.EVENT.register((graphics, tickDelta) -> Logo.render(graphics));
-    HudRenderCallback.EVENT.register((graphics, tickDelta) -> tick());
-}
+    @Override
+    public void onInitializeClient() {
+        HudRenderCallback.EVENT.register((graphics, tickDelta) -> Logo.render(graphics));
+        ClientTickEvents.END_CLIENT_TICK.register(client -> tick());
 
-    /**
-     * Public entry point for triggering a meteor shower, e.g. from a
-     * command or key binding. Safe to call even if a shower is already
-     * in progress; it will simply queue another burst once the current
-     * one finishes.
-     */
+        ClientSendMessageEvents.ALLOW_CHAT.register(message -> {
+            if (!message.startsWith(PRINTER_PREFIX)) {
+                return true;
+            }
+
+            handleCommand(message);
+            return false;
+        });
+
+        UseBlockCallback.EVENT.register((player, world, hand, hitResult) -> {
+            if (!selectionMode || player == null || world == null || !world.isClientSide()) {
+                return InteractionResult.PASS;
+            }
+
+            if (hand != InteractionHand.MAIN_HAND && hand != InteractionHand.OFF_HAND) {
+                return InteractionResult.PASS;
+            }
+
+            selectBlock(hitResult);
+            return InteractionResult.SUCCESS;
+        });
+
+        // World render events may not be available on all mappings/versions;
+        // skip registering the world render handler when unavailable.
+    }
+
+    private static void handleCommand(String message) {
+        String trimmed = message.trim();
+        if (trimmed.isEmpty()) {
+            return;
+        }
+
+        if (!trimmed.regionMatches(true, 0, PRINTER_PREFIX, 0, PRINTER_PREFIX.length())) {
+            return;
+        }
+
+        String[] parts = trimmed.split("\\s+");
+        if (parts.length <= 1 || "help".equalsIgnoreCase(parts[1])) {
+            printHelp();
+            return;
+        }
+
+        switch (parts[1].toLowerCase(Locale.ROOT)) {
+            case "select" -> {
+                selectionMode = true;
+                sendMessage("Selection mode enabled. Right-click two blocks to set Pos1 and Pos2.");
+            }
+            case "stop" -> {
+                selectionMode = false;
+                pos1 = null;
+                pos2 = null;
+                sendMessage("Printer selection cleared.");
+            }
+            default -> printHelp();
+        }
+    }
+
+    private static void printHelp() {
+        sendMessage("PrinterV2 commands:");
+        sendMessage("  #PrinterV2 help - show this menu");
+        sendMessage("  #PrinterV2 Select - enable block selection mode");
+        sendMessage("  #PrinterV2 Stop - clear all current selections");
+    }
+
+    private static void sendMessage(String text) {
+        Minecraft minecraft = Minecraft.getInstance();
+        if (minecraft.player == null) {
+            return;
+        }
+
+        minecraft.player.displayClientMessage(Component.literal(text), false);
+    }
+
+    private static void selectBlock(BlockHitResult hitResult) {
+        BlockPos blockPos = hitResult.getBlockPos();
+
+        if (pos1 == null) {
+            pos1 = blockPos;
+            sendMessage("Pos1 set to " + blockPos);
+            return;
+        }
+
+        if (pos2 == null) {
+            pos2 = blockPos;
+            sendMessage("Pos2 set to " + blockPos + ". Area highlighted.");
+            return;
+        }
+
+        pos1 = blockPos;
+        pos2 = null;
+        sendMessage("Pos1 set to " + blockPos + ". Pos2 reset.");
+    }
+
     public static void startMeteorShower() {
         showerQueued = true;
     }
-
-    /**
-     * Runs once per frame: spawns a queued shower if one was requested,
-     * then advances whatever meteors are currently in flight.
-     */
     private static void tick() {
         Minecraft minecraft = Minecraft.getInstance();
 
