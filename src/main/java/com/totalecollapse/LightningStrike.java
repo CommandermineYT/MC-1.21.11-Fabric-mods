@@ -9,18 +9,19 @@ import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.phys.Vec3;
 
 public final class LightningStrike {
+
     private LightningStrike() {
     }
 
     public static void triggerLightning(ServerLevel level, Vec3 origin) {
         BlockPos pos = findGroundPos(level, origin);
         LightningBolt bolt = EntityType.LIGHTNING_BOLT.create(
-            level,
-            null,
-            pos,
-            EntitySpawnReason.COMMAND,
-            true,
-            false
+                level,
+                null,
+                pos,
+                EntitySpawnReason.COMMAND,
+                true,
+                false
         );
 
         if (bolt != null) {
