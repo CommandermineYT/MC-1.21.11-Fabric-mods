@@ -2,8 +2,11 @@ package com.totalecollapse;
 
 import java.util.ArrayList;
 import java.util.Iterator;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Random;
+import java.util.Set;
+import java.util.UUID;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -14,22 +17,35 @@ import com.mojang.brigadier.arguments.DoubleArgumentType;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.event.player.UseEntityCallback;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.minecraft.commands.Commands;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Holder;
 import net.minecraft.core.particles.BlockParticleOption;
 import net.minecraft.core.particles.ParticleTypes;
+import net.minecraft.network.protocol.game.ClientboundSetEntityMotionPacket;
+import net.minecraft.network.protocol.game.ClientboundSoundPacket;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.sounds.SoundEvent;
+import net.minecraft.sounds.SoundEvents;
+import net.minecraft.sounds.SoundSource;
+import net.minecraft.util.Mth;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
+import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.item.FallingBlockEntity;
 import net.minecraft.world.entity.monster.Enemy;
-import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.levelgen.Heightmap;
+import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
+
 public class TotaleCollapse implements ModInitializer {
 
     public static final String MOD_ID = "totale-collapse";
@@ -54,6 +70,23 @@ public class TotaleCollapse implements ModInitializer {
     private static final Random RANDOM = new Random();
     private static final List<MeteorGroup> ACTIVE_METEORS = new ArrayList<>();
     private static final List<MeteorStorm> ACTIVE_STORMS = new ArrayList<>();
+
+    // ---- Crater tuning ----
+    private static final double CRATER_EDGE_WOBBLE = 1.6;
+    private static final double CRATER_CRUST_BAND = 0.78;
+
+    // ---- Shockwave tuning ----
+    private static final int SHOCKWAVE_TRAVEL_TICKS = 12;
+    private static final int SHOCKWAVE_MAX_AGE = 40;
+    private static final double SHOCKWAVE_PEAK_KNOCKBACK = 1.5;
+    private static final double SHOCKWAVE_WALL_HEIGHT = 6.0;
+
+    // ---- Delayed boom tuning ----
+    private static final double SPEED_OF_SOUND_BLOCKS_PER_TICK = 17.0;
+    private static final double MAX_BOOM_DISTANCE = 400.0;
+
+    private static final List<Shockwave> ACTIVE_SHOCKWAVES = new ArrayList<>();
+    private static final List<DelayedBoom> PENDING_BOOMS = new ArrayList<>();
 
     @Override
     public void onInitialize() {
@@ -153,11 +186,22 @@ public class TotaleCollapse implements ModInitializer {
             tickMeteors();
             MindControlManager.tick();
         });
+
+        // Static collections survive a world reload, so wipe them when the
+        // integrated server shuts down.
+        ServerLifecycleEvents.SERVER_STOPPED.register(server -> {
+            ACTIVE_METEORS.clear();
+            ACTIVE_STORMS.clear();
+            ACTIVE_SHOCKWAVES.clear();
+            PENDING_BOOMS.clear();
+        });
     }
 
     private static void tickMeteors() {
         tickStorms();
         tickMeteorGroups();
+        tickShockwaves();
+        tickBooms();
     }
 
     private static void tickStorms() {
@@ -336,6 +380,7 @@ private static void tickMeteorGroups() {
             if (!lostToVoid) {
                 createMeteorCrater(group.level, impact, group.meteorSize);
                 spawnImpactBurst(group.level, impact);
+                triggerShockwave(group.level, impact, group.meteorSize);
             }
 
             iterator.remove();
@@ -422,24 +467,366 @@ private static boolean willHitSomething(ServerLevel level, FallingBlockEntity me
             Vec3 position,
             int meteorSize
     ) {
-        float explosionPower = switch (meteorSize) {
+        int craterRadius = switch (meteorSize) {
             case 3 ->
-                5.0F;
+                6;
             case 5 ->
-                7.0F;
+                9;
             case 9 ->
-                12.0F;
+                14;
             default ->
-                6.0F;
+                7;
         };
 
-        level.explode(
-                null,
-                position.x,
-                position.y,
-                position.z,
-                explosionPower,
-                Level.ExplosionInteraction.BLOCK
+        carveCrater(level, position, craterRadius);
+        throwEjecta(level, position, craterRadius);
+    }
+
+    /**
+     * Carves a bowl instead of letting vanilla's explosion chew a random hole.
+     * The floor gets a blackstone shell, the outer band is crusted with magma,
+     * and the rim is wobbled so it never reads as a perfect circle.
+     */
+    private static void carveCrater(ServerLevel level, Vec3 center, int craterRadius) {
+        BlockPos origin = BlockPos.containing(center.x, center.y, center.z);
+        int maxDepth = Math.max(2, craterRadius / 2);
+
+        BlockPos.MutableBlockPos cursor = new BlockPos.MutableBlockPos();
+
+        for (int dx = -craterRadius; dx <= craterRadius; dx++) {
+            for (int dz = -craterRadius; dz <= craterRadius; dz++) {
+                double horizontal = Math.sqrt((double) dx * dx + (double) dz * dz);
+                double edge = craterRadius + (RANDOM.nextDouble() - 0.5) * CRATER_EDGE_WOBBLE;
+
+                if (horizontal > edge) {
+                    continue;
+                }
+
+                double normalized = horizontal / edge;
+
+                // cos() gives a smooth bowl: deepest in the middle, flat at the rim.
+                int depth = (int) Math.round(maxDepth * Math.cos(normalized * Math.PI / 2.0));
+
+                for (int dy = -depth; dy <= 1; dy++) {
+                    cursor.set(origin.getX() + dx, origin.getY() + dy, origin.getZ() + dz);
+
+                    if (!isCarvable(level, cursor)) {
+                        continue;
+                    }
+
+                    level.setBlock(cursor, Blocks.AIR.defaultBlockState(), Block.UPDATE_CLIENTS);
+                }
+
+                // Crust the floor one block below the carve.
+                cursor.set(origin.getX() + dx, origin.getY() - depth - 1, origin.getZ() + dz);
+
+                if (!isCarvable(level, cursor)) {
+                    continue;
+                }
+
+                boolean scorched = normalized > CRATER_CRUST_BAND || RANDOM.nextInt(4) == 0;
+
+                level.setBlock(
+                        cursor,
+                        scorched
+                                ? Blocks.MAGMA_BLOCK.defaultBlockState()
+                                : Blocks.BLACKSTONE.defaultBlockState(),
+                        Block.UPDATE_CLIENTS
+                );
+            }
+        }
+    }
+
+    /** True for blocks we are allowed to replace: solid, present, and breakable. */
+    private static boolean isCarvable(ServerLevel level, BlockPos pos) {
+        BlockState state = level.getBlockState(pos);
+
+        if (state.isAir() || state.is(Blocks.BEDROCK)) {
+            return false;
+        }
+
+        return state.getDestroySpeed(level, pos) >= 0.0F;
+    }
+
+    /** Throws real falling blocks outward from the rim so debris rains down. */
+    private static void throwEjecta(ServerLevel level, Vec3 center, int craterRadius) {
+        int chunkCount = Math.min(24, craterRadius * 2);
+
+        for (int i = 0; i < chunkCount; i++) {
+            double angle = RANDOM.nextDouble() * Math.PI * 2.0;
+            double distance = craterRadius * (0.65 + RANDOM.nextDouble() * 0.45);
+
+            double x = center.x + Math.cos(angle) * distance;
+            double z = center.z + Math.sin(angle) * distance;
+
+            int surface = level.getHeight(
+                    Heightmap.Types.MOTION_BLOCKING,
+                    Mth.floor(x),
+                    Mth.floor(z)
+            );
+
+            FallingBlockEntity debris = FallingBlockEntity.fall(
+                    level,
+                    BlockPos.containing(x, surface + 1.0, z),
+                    RANDOM.nextBoolean()
+                            ? Blocks.MAGMA_BLOCK.defaultBlockState()
+                            : Blocks.BLACKSTONE.defaultBlockState()
+            );
+
+            debris.dropItem = false;
+            debris.setHurtsEntities(2.0F, 6);
+
+            double outward = 0.30 + RANDOM.nextDouble() * 0.35;
+
+            debris.setDeltaMovement(
+                    Math.cos(angle) * outward,
+                    0.55 + RANDOM.nextDouble() * 0.40,
+                    Math.sin(angle) * outward
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Ground shockwave
+    // ------------------------------------------------------------------
+    private static void triggerShockwave(ServerLevel level, Vec3 impact, int meteorSize) {
+        double maxRadius = switch (meteorSize) {
+            case 3 ->
+                12.0;
+            case 5 ->
+                20.0;
+            case 9 ->
+                32.0;
+            default ->
+                16.0;
+        };
+
+        float peakDamage = switch (meteorSize) {
+            case 3 ->
+                6.0F;
+            case 5 ->
+                11.0F;
+            case 9 ->
+                18.0F;
+            default ->
+                8.0F;
+        };
+
+        ACTIVE_SHOCKWAVES.add(
+                new Shockwave(
+                        level,
+                        impact,
+                        maxRadius,
+                        maxRadius / SHOCKWAVE_TRAVEL_TICKS,
+                        peakDamage,
+                        SHOCKWAVE_PEAK_KNOCKBACK
+                )
+        );
+
+        scheduleDistantBoom(level, impact, meteorSize);
+    }
+
+    private static void tickShockwaves() {
+        Iterator<Shockwave> iterator = ACTIVE_SHOCKWAVES.iterator();
+
+        while (iterator.hasNext()) {
+            Shockwave wave = iterator.next();
+
+            double inner = wave.radius;
+            wave.radius = Math.min(wave.maxRadius, wave.radius + wave.speed);
+            wave.age++;
+
+            drawShockwaveRing(wave, inner, wave.radius);
+            pushEntities(wave, inner, wave.radius);
+
+            if (wave.radius >= wave.maxRadius || wave.age > SHOCKWAVE_MAX_AGE) {
+                iterator.remove();
+            }
+        }
+    }
+
+    /** Draws the ring at terrain height so it hugs slopes instead of clipping. */
+    private static void drawShockwaveRing(Shockwave wave, double inner, double outer) {
+        double mid = (inner + outer) / 2.0;
+
+        if (mid < 0.5) {
+            return;
+        }
+
+        int samples = Math.max(16, (int) (mid * 5.0));
+        double fade = Math.max(0.0, 1.0 - mid / wave.maxRadius);
+
+        for (int i = 0; i < samples; i++) {
+            double angle = (Math.PI * 2.0 / samples) * i;
+
+            double x = wave.origin.x + Math.cos(angle) * mid;
+            double z = wave.origin.z + Math.sin(angle) * mid;
+
+            int surface = wave.level.getHeight(
+                    Heightmap.Types.MOTION_BLOCKING,
+                    Mth.floor(x),
+                    Mth.floor(z)
+            );
+
+            // A wall taller than this stops the wave being drawn up its face.
+            if (surface > wave.origin.y + SHOCKWAVE_WALL_HEIGHT) {
+                continue;
+            }
+
+            wave.level.sendParticles(
+                    ParticleTypes.CLOUD,
+                    x,
+                    surface + 0.2,
+                    z,
+                    1,
+                    0.12,
+                    0.02,
+                    0.12,
+                    0.02 + 0.05 * fade
+            );
+
+            if (i % 3 != 0) {
+                continue;
+            }
+
+            BlockPos groundPos = BlockPos.containing(x, surface - 1.0, z);
+            BlockState ground = wave.level.getBlockState(groundPos);
+
+            if (ground.isAir()) {
+                continue;
+            }
+
+            wave.level.sendParticles(
+                    new BlockParticleOption(ParticleTypes.BLOCK, ground),
+                    x,
+                    surface + 0.1,
+                    z,
+                    2,
+                    0.15,
+                    0.05,
+                    0.15,
+                    0.05
+            );
+        }
+    }
+
+    /** Shoves and damages anything caught in this tick's expanding band. */
+    private static void pushEntities(Shockwave wave, double inner, double outer) {
+        AABB band = new AABB(
+                wave.origin.x - outer,
+                wave.origin.y - 4.0,
+                wave.origin.z - outer,
+                wave.origin.x + outer,
+                wave.origin.y + 6.0,
+                wave.origin.z + outer
+        );
+
+        for (LivingEntity entity : wave.level.getEntitiesOfClass(LivingEntity.class, band)) {
+            if (entity instanceof ServerPlayer player && (player.isSpectator() || player.isCreative())) {
+                continue;
+            }
+
+            double dx = entity.getX() - wave.origin.x;
+            double dz = entity.getZ() - wave.origin.z;
+            double distance = Math.sqrt(dx * dx + dz * dz);
+
+            if (distance > outer || distance < inner - 1.0) {
+                continue;
+            }
+
+            // One hit per wave, no matter how many ticks it overlaps them.
+            if (!wave.alreadyHit.add(entity.getUUID())) {
+                continue;
+            }
+
+            double falloff = Math.max(0.0, 1.0 - distance / wave.maxRadius);
+
+            double nx = distance < 0.1 ? RANDOM.nextDouble() - 0.5 : dx / distance;
+            double nz = distance < 0.1 ? RANDOM.nextDouble() - 0.5 : dz / distance;
+
+            double push = wave.peakKnockback * falloff;
+
+            entity.push(nx * push, 0.15 + 0.35 * falloff, nz * push);
+            entity.hurtMarked = true;
+
+            float damage = (float) (wave.peakDamage * falloff);
+
+            if (damage >= 0.5F) {
+                entity.hurtServer(
+                        wave.level,
+                        wave.level.damageSources().explosion(null, null),
+                        damage
+                );
+            }
+
+            // Players ignore server-side velocity unless it is pushed to them.
+            if (entity instanceof ServerPlayer player) {
+                player.connection.send(new ClientboundSetEntityMotionPacket(player));
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Delayed, distance-based boom
+    // ------------------------------------------------------------------
+    private static void scheduleDistantBoom(ServerLevel level, Vec3 impact, int meteorSize) {
+        float volume = 3.0F + meteorSize * 0.5F;
+        float pitch = Math.max(0.4F, 1.1F - meteorSize * 0.06F);
+
+        for (ServerPlayer player : level.players()) {
+            double distance = Math.sqrt(player.distanceToSqr(impact));
+
+            if (distance > MAX_BOOM_DISTANCE) {
+                continue;
+            }
+
+            int delay = (int) (distance / SPEED_OF_SOUND_BLOCKS_PER_TICK);
+
+            if (delay <= 0) {
+                playBoom(player, impact, volume, pitch);
+                continue;
+            }
+
+            PENDING_BOOMS.add(
+                    new DelayedBoom(player.getUUID(), level, impact, delay, volume, pitch)
+            );
+        }
+    }
+
+    private static void tickBooms() {
+        Iterator<DelayedBoom> iterator = PENDING_BOOMS.iterator();
+
+        while (iterator.hasNext()) {
+            DelayedBoom boom = iterator.next();
+
+            if (boom.ticksRemaining-- > 0) {
+                continue;
+            }
+
+            ServerPlayer player = boom.level.getServer().getPlayerList().getPlayer(boom.playerId);
+
+            if (player != null) {
+                playBoom(player, boom.impact, boom.volume, boom.pitch);
+            }
+
+            iterator.remove();
+        }
+    }
+
+    private static void playBoom(ServerPlayer player, Vec3 impact, float volume, float pitch) {
+        Holder<SoundEvent> sound = SoundEvents.GENERIC_EXPLODE;
+
+        player.connection.send(
+                new ClientboundSoundPacket(
+                        sound,
+                        SoundSource.BLOCKS,
+                        impact.x,
+                        impact.y,
+                        impact.z,
+                        volume,
+                        pitch,
+                        RANDOM.nextLong()
+                )
         );
     }
 
@@ -484,6 +871,65 @@ private static boolean willHitSomething(ServerLevel level, FallingBlockEntity me
                 1.6,
                 0.10
         );
+    }
+
+    private static final class Shockwave {
+
+        private final ServerLevel level;
+        private final Vec3 origin;
+        private final double maxRadius;
+        private final double speed;
+        private final float peakDamage;
+        private final double peakKnockback;
+        private final Set<UUID> alreadyHit = new HashSet<>();
+
+        private double radius;
+        private int age;
+
+        private Shockwave(
+                ServerLevel level,
+                Vec3 origin,
+                double maxRadius,
+                double speed,
+                float peakDamage,
+                double peakKnockback
+        ) {
+            this.level = level;
+            this.origin = origin;
+            this.maxRadius = maxRadius;
+            this.speed = speed;
+            this.peakDamage = peakDamage;
+            this.peakKnockback = peakKnockback;
+            this.radius = 0.0;
+            this.age = 0;
+        }
+    }
+
+    private static final class DelayedBoom {
+
+        private final UUID playerId;
+        private final ServerLevel level;
+        private final Vec3 impact;
+        private final float volume;
+        private final float pitch;
+
+        private int ticksRemaining;
+
+        private DelayedBoom(
+                UUID playerId,
+                ServerLevel level,
+                Vec3 impact,
+                int ticksRemaining,
+                float volume,
+                float pitch
+        ) {
+            this.playerId = playerId;
+            this.level = level;
+            this.impact = impact;
+            this.ticksRemaining = ticksRemaining;
+            this.volume = volume;
+            this.pitch = pitch;
+        }
     }
 
     private static final class MeteorGroup {
