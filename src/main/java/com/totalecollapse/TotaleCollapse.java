@@ -34,7 +34,8 @@ import net.minecraft.world.entity.item.FallingBlockEntity;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.phys.Vec3;
-
+import net.fabricmc.fabric.api.entity.event.v1.ServerLivingEntityEvents;
+import net.minecraft.world.entity.monster.Enemy;
 public class TotaleCollapse implements ModInitializer {
 
     public static final String MOD_ID = "totale-collapse";
@@ -81,17 +82,20 @@ public class TotaleCollapse implements ModInitializer {
             }
 
             UseEntityCallback.EVENT.register((player, world, hand, entity, hitResult) -> {
-                if (world.isClientSide() || hand != InteractionHand.MAIN_HAND) {
-                    return InteractionResult.PASS;
-                }
-                if (!(player instanceof ServerPlayer serverPlayer) || !MindControlManager.isAwaitingTarget(serverPlayer)) {
-                    return InteractionResult.PASS;
-                }
+    if (world.isClientSide() || hand != InteractionHand.MAIN_HAND) {
+        return InteractionResult.PASS;
+    }
+    if (!(player instanceof ServerPlayer serverPlayer) || !MindControlManager.isAwaitingTarget(serverPlayer)) {
+        return InteractionResult.PASS;
+    }
 
-                MindControlManager.tryPossess(serverPlayer, entity);
-                return InteractionResult.SUCCESS;
-            });
-
+    MindControlManager.tryPossess(serverPlayer, entity);
+    return InteractionResult.SUCCESS;
+});
+            
+            ServerLivingEntityEvents.ALLOW_DAMAGE.register((entity, source, amount) ->
+    !(MindControlManager.isPossessedEntity(entity) && source.getEntity() instanceof Enemy));
+    
             ServerPlayConnectionEvents.DISCONNECT.register((handler, server)
                     -> MindControlManager.handleDisconnect(handler.getPlayer()));
             if (target != null) {
@@ -549,12 +553,18 @@ public class TotaleCollapse implements ModInitializer {
             Vec3 trailPosition = null;
             boolean anyBlockIsAlive = false;
 
+            Vec3 totalPosition = Vec3.ZERO;
+            int aliveCount = 0;
+
             for (FallingBlockEntity meteor : group.blocks) {
                 if (!meteor.isAlive()) {
                     continue;
                 }
 
                 Vec3 meteorPosition = meteor.position();
+                totalPosition = totalPosition.add(meteorPosition);
+                aliveCount++;
+
                 BlockPos blockBelow = BlockPos.containing(
                         meteorPosition.x,
                         meteorPosition.y - 0.6,
@@ -563,6 +573,7 @@ public class TotaleCollapse implements ModInitializer {
 
                 if (!group.level.getBlockState(blockBelow).isAir()) {
                     group.lastKnownPosition = meteorPosition;
+                    clearMeteorBlock(group.level, meteor);
                     meteor.discard();
                     continue;
                 }
@@ -573,12 +584,19 @@ public class TotaleCollapse implements ModInitializer {
                 sendTrailParticles(group.level, trailPosition);
             }
 
+            if (aliveCount > 0) {
+                group.lastKnownPosition = totalPosition.scale(1.0 / aliveCount);
+            }
+
             if (!anyBlockIsAlive) {
+                discardRemainingBlocks(group);
+
                 createMeteorCrater(
                         group.level,
                         group.lastKnownPosition,
                         group.meteorSize
                 );
+
                 spawnImpactBurst(group.level, group.lastKnownPosition);
 
                 iterator.remove();
@@ -588,6 +606,22 @@ public class TotaleCollapse implements ModInitializer {
             if (trailPosition != null) {
                 group.lastKnownPosition = trailPosition;
             }
+        }
+    }
+
+    private static void discardRemainingBlocks(MeteorGroup group) {
+        for (FallingBlockEntity meteor : group.blocks) {
+            clearMeteorBlock(group.level, meteor);
+            if (meteor.isAlive()) {
+                meteor.discard();
+            }
+        }
+    }
+
+    private static void clearMeteorBlock(ServerLevel level, FallingBlockEntity meteor) {
+        BlockPos pos = meteor.blockPosition();
+        if (level.getBlockState(pos).is(Blocks.MAGMA_BLOCK)) {
+            level.setBlock(pos, Blocks.AIR.defaultBlockState(), 3);
         }
     }
 

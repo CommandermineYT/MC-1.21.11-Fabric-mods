@@ -18,15 +18,19 @@ import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.MoverType;
+import net.minecraft.world.entity.monster.Enemy;
 import net.minecraft.world.level.GameType;
+import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 
 public final class MindControlManager {
-
     private static final Logger LOGGER = LoggerFactory.getLogger("totale-collapse-mindcontrol");
 
     private static final Set<UUID> AWAITING_TARGET = new HashSet<>();
     private static final Map<UUID, Possession> ACTIVE = new HashMap<>();
+    private static final Set<UUID> POSSESSED_ENTITY_IDS = new HashSet<>();
+
+    private static final double HOSTILE_PROTECTION_RADIUS = 48.0;
 
     private MindControlManager() {
     }
@@ -36,7 +40,7 @@ public final class MindControlManager {
 
         if (ACTIVE.containsKey(id)) {
             player.sendSystemMessage(Component.literal(
-                    "You're already mind controlling something. Use /collapse MindControll Stop first."));
+                "You're already mind controlling something. Use /collapse MindControll Stop first."));
             return;
         }
 
@@ -46,6 +50,10 @@ public final class MindControlManager {
 
     public static boolean isAwaitingTarget(ServerPlayer player) {
         return AWAITING_TARGET.contains(player.getUUID());
+    }
+
+    public static boolean isPossessedEntity(Entity entity) {
+        return entity instanceof LivingEntity livingEntity && POSSESSED_ENTITY_IDS.contains(livingEntity.getUUID());
     }
 
     public static void tryPossess(ServerPlayer player, Entity target) {
@@ -68,17 +76,19 @@ public final class MindControlManager {
         GameType previousMode = player.gameMode.getGameModeForPlayer();
         boolean previousNoAi = livingTarget instanceof Mob mob && mob.isNoAi();
 
-        ACTIVE.put(id, new Possession(id, livingTarget, previousMode, previousNoAi, player.position()));
+        ACTIVE.put(id, new Possession(id, livingTarget, previousMode, previousNoAi));
+        POSSESSED_ENTITY_IDS.add(livingTarget.getUUID());
 
         if (livingTarget instanceof Mob mob) {
             mob.setNoAi(true);
+            mob.setTarget(null);
         }
 
         player.gameMode.changeGameModeForPlayer(GameType.SPECTATOR);
         player.connection.send(new ClientboundSetCameraPacket(livingTarget));
 
         player.sendSystemMessage(Component.literal(
-                "Mind controlling " + livingTarget.getName().getString() + ". Use /collapse MindControll Stop to release it."));
+            "Mind controlling " + livingTarget.getName().getString() + ". Use /collapse MindControll Stop to release it."));
 
         LOGGER.info("{} began mind controlling {}", player.getName().getString(), livingTarget);
     }
@@ -90,9 +100,10 @@ public final class MindControlManager {
         Possession possession = ACTIVE.remove(id);
 
         if (possession != null) {
+            POSSESSED_ENTITY_IDS.remove(possession.target().getUUID());
             release(player, possession);
             player.sendSystemMessage(Component.literal(
-                    "Released control of " + possession.target().getName().getString() + "."));
+                "Released control of " + possession.target().getName().getString() + "."));
             return;
         }
 
@@ -117,8 +128,11 @@ public final class MindControlManager {
         AWAITING_TARGET.remove(player.getUUID());
 
         Possession possession = ACTIVE.remove(player.getUUID());
-        if (possession != null && possession.target().isAlive() && possession.target() instanceof Mob mob) {
-            mob.setNoAi(possession.previousNoAi());
+        if (possession != null) {
+            POSSESSED_ENTITY_IDS.remove(possession.target().getUUID());
+            if (possession.target().isAlive() && possession.target() instanceof Mob mob) {
+                mob.setNoAi(possession.previousNoAi());
+            }
         }
     }
 
@@ -135,41 +149,76 @@ public final class MindControlManager {
                 if (player != null) {
                     release(player, possession);
                 }
+                POSSESSED_ENTITY_IDS.remove(target.getUUID());
                 iterator.remove();
                 continue;
             }
 
-            Vec3 currentPos = player.position();
-            Vec3 delta = currentPos.subtract(possession.lastPlayerPos());
+            float forward = player.zza;
+            float strafe = player.xxa;
 
-            if (delta.horizontalDistanceSqr() > 1.0E-6) {
-                target.move(MoverType.SELF, new Vec3(delta.x, 0.0, delta.z));
+            double WALK_SPEED = 0.3;
+            double yawRad = Math.toRadians(player.getYRot());
+            double sin = Math.sin(yawRad);
+            double cos = Math.cos(yawRad);
+
+            Vec3 forwardVec = new Vec3(-sin, 0.0, cos);
+            Vec3 strafeVec = new Vec3(cos, 0.0, sin).scale(strafe);
+
+            Vec3 motion;
+            if (forward == 0.0F && strafe == 0.0F) {
+                motion = Vec3.ZERO;
+            } else {
+                motion = forwardVec.scale(forward).add(strafeVec);
+                double len = Math.sqrt(motion.x * motion.x + motion.z * motion.z);
+                if (len > 1.0E-6) {
+                    motion = motion.scale(WALK_SPEED / len);
+                } else {
+                    motion = Vec3.ZERO;
+                }
             }
+
+            double verticalVel = target.getDeltaMovement().y;
+            motion = new Vec3(motion.x, verticalVel, motion.z);
+
+            target.setDeltaMovement(motion);
+            target.move(MoverType.SELF, motion);
 
             target.setYRot(player.getYRot());
             target.setYHeadRot(player.getYRot());
             target.setYBodyRot(player.getYRot());
             target.setXRot(player.getXRot());
 
-            player.teleportTo(target.getX(), target.getY(), target.getZ());
-            possession.setLastPlayerPos(player.position());
+            protectFromHostiles(target);
         }
     }
 
-    private static final class Possession {
+    private static void protectFromHostiles(LivingEntity target) {
+        if (!(target.level() instanceof ServerLevel serverLevel)) {
+            return;
+        }
 
+        AABB searchArea = target.getBoundingBox().inflate(HOSTILE_PROTECTION_RADIUS);
+
+        serverLevel.getEntitiesOfClass(
+                Mob.class,
+                searchArea,
+                mob -> mob instanceof Enemy && mob.getTarget() == target
+            )
+            .forEach(mob -> mob.setTarget(null));
+    }
+
+    private static final class Possession {
         private final UUID playerId;
         private final LivingEntity target;
         private final GameType previousMode;
         private final boolean previousNoAi;
-        private Vec3 lastPlayerPos;
 
-        private Possession(UUID playerId, LivingEntity target, GameType previousMode, boolean previousNoAi, Vec3 lastPlayerPos) {
+        private Possession(UUID playerId, LivingEntity target, GameType previousMode, boolean previousNoAi) {
             this.playerId = playerId;
             this.target = target;
             this.previousMode = previousMode;
             this.previousNoAi = previousNoAi;
-            this.lastPlayerPos = lastPlayerPos;
         }
 
         private LivingEntity target() {
@@ -182,14 +231,6 @@ public final class MindControlManager {
 
         private boolean previousNoAi() {
             return previousNoAi;
-        }
-
-        private Vec3 lastPlayerPos() {
-            return lastPlayerPos;
-        }
-
-        private void setLastPlayerPos(Vec3 pos) {
-            this.lastPlayerPos = pos;
         }
 
         private ServerPlayer resolvePlayer() {
