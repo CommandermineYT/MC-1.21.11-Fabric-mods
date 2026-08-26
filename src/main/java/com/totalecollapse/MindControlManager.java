@@ -38,9 +38,9 @@ public final class MindControlManager {
     public static void beginAwaitingTarget(ServerPlayer player) {
         UUID id = player.getUUID();
 
-        if (ACTIVE.containsKey(id)) {
+        if (ACTIVE.containsKey(id) || AWAITING_TARGET.contains(id)) {
             player.sendSystemMessage(Component.literal(
-                "You're already mind controlling something. Use /collapse MindControll Stop first."));
+                "You're already mind controlling something. Use /collapse MindControl Stop first."));
             return;
         }
 

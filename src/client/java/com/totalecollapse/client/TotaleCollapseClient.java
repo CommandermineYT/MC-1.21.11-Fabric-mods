@@ -13,22 +13,15 @@ import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
 import net.fabricmc.fabric.api.event.player.UseBlockCallback;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
-import net.minecraft.client.renderer.LevelRenderer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.particles.ParticleTypes;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
-import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.Vec3;
-import com.mojang.blaze3d.vertex.PoseStack;
 
-/**
- * Client-side initializer for the Totale Collapse mod.
- * Handles rendering of the HUD logo and an optional meteor shower
- * particle effect that can be triggered around the player.
- */
+
 public class TotaleCollapseClient implements ClientModInitializer {
 
     private static final String PRINTER_PREFIX = "#PrinterV2";
@@ -36,9 +29,8 @@ public class TotaleCollapseClient implements ClientModInitializer {
     private static BlockPos pos1 = null;
     private static BlockPos pos2 = null;
 
-    // ---- Meteor shower tuning ----
     private static final int METEOR_COUNT = 35;
-    private static final int MAX_ACTIVE_METEORS = 200; // safety cap so the list can't grow unbounded
+    private static final int MAX_ACTIVE_METEORS = 200;
     private static final double MIN_RADIUS = 4.0;
     private static final double MAX_RADIUS = 50.0;
     private static final double START_HEIGHT = 30.0;
@@ -46,7 +38,6 @@ public class TotaleCollapseClient implements ClientModInitializer {
     private static final double MAX_ANGLE = 50.0;
     private static final double SPEED = 0.75;
 
-    // ---- Impact particle tuning ----
     private static final int IMPACT_PARTICLE_COUNT = 12;
     private static final double IMPACT_SPREAD = 0.35;
     private static final double IMPACT_LIFT = 0.25;
@@ -54,7 +45,6 @@ public class TotaleCollapseClient implements ClientModInitializer {
     private static final Random RANDOM = new Random();
     private static final List<Meteor> METEORS = new ArrayList<>();
 
-    /** Set true to spawn a fresh burst of meteors on the next tick. */
     private static boolean showerQueued = false;
 
     @Override
@@ -87,6 +77,8 @@ public class TotaleCollapseClient implements ClientModInitializer {
         // World render events may not be available on all mappings/versions;
         // skip registering the world render handler when unavailable.
     }
+
+
 
     private static void handleCommand(String message) {
         String trimmed = message.trim();

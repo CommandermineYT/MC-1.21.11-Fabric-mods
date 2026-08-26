@@ -49,6 +49,7 @@ public class TotaleCollapse implements ModInitializer {
     private static final double MIN_ANGLE_DEGREES = 35.0;
     private static final double MAX_ANGLE_DEGREES = 65.0;
     private static final double SPEED = 0.75;
+    private static final int MAX_GROUP_LIFETIME_TICKS = 600;
 
     private static final Random RANDOM = new Random();
     private static final List<MeteorGroup> ACTIVE_METEORS = new ArrayList<>();
@@ -265,10 +266,29 @@ public class TotaleCollapse implements ModInitializer {
             }
         }
 
+        // Visual effect for breaking through the atmosphere
+        spawnAtmosphericBreach(level, groupCenter, meteorSize);
+
         ACTIVE_METEORS.add(new MeteorGroup(level, blocks, groupCenter, meteorSize));
     }
 
-    private static final int MAX_GROUP_LIFETIME_TICKS = 600;
+    private static void spawnAtmosphericBreach(ServerLevel level, Vec3 pos, int meteorSize) {
+    level.sendParticles(ParticleTypes.SONIC_BOOM, pos.x, pos.y, pos.z, 1, 0.0, 0.0, 0.0, 0.0);
+
+    int ringPoints = 20 + meteorSize * 2;
+    double ringRadius = meteorSize * 0.9;
+
+    for (int i = 0; i < ringPoints; i++) {
+        double angle = (Math.PI * 2.0 / ringPoints) * i;
+        level.sendParticles(
+                ParticleTypes.CLOUD,
+                pos.x + Math.cos(angle) * ringRadius,
+                pos.y,
+                pos.z + Math.sin(angle) * ringRadius,
+                1, 0.0, 0.0, 0.0, 0.04
+        );
+    }
+}
 
 private static void tickMeteorGroups() {
     Iterator<MeteorGroup> iterator = ACTIVE_METEORS.iterator();
