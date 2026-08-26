@@ -44,7 +44,6 @@ public class TotaleCollapseClient implements ClientModInitializer {
 public void onInitializeClient() {
     HudRenderCallback.EVENT.register((graphics, tickDelta) -> Logo.render(graphics));
     HudRenderCallback.EVENT.register((graphics, tickDelta) -> tick());
-    LightningStrike.init(); // <-- add this
 }
 
     /**

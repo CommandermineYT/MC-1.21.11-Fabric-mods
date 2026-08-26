@@ -84,7 +84,6 @@ public final class MindControlManager {
             mob.setTarget(null);
         }
 
-        player.gameMode.changeGameModeForPlayer(GameType.SPECTATOR);
         player.connection.send(new ClientboundSetCameraPacket(livingTarget));
 
         player.sendSystemMessage(Component.literal(
