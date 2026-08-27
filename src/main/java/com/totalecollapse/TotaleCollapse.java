@@ -13,6 +13,7 @@ import org.slf4j.LoggerFactory;
 
 import com.mojang.brigadier.Command;
 import com.mojang.brigadier.arguments.DoubleArgumentType;
+import com.mojang.brigadier.arguments.IntegerArgumentType;
 
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
@@ -23,14 +24,14 @@ import net.fabricmc.fabric.api.event.player.UseEntityCallback;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.minecraft.commands.Commands;
 import net.minecraft.core.BlockPos;
-import net.minecraft.core.Holder;
 import net.minecraft.core.particles.BlockParticleOption;
+import net.minecraft.core.particles.ParticleOptions;
 import net.minecraft.core.particles.ParticleTypes;
+import net.minecraft.network.chat.Component;
 import net.minecraft.network.protocol.game.ClientboundSetEntityMotionPacket;
 import net.minecraft.network.protocol.game.ClientboundSoundPacket;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
-import net.minecraft.sounds.SoundEvent;
 import net.minecraft.sounds.SoundEvents;
 import net.minecraft.sounds.SoundSource;
 import net.minecraft.util.Mth;
@@ -76,10 +77,26 @@ public class TotaleCollapse implements ModInitializer {
     private static final double CRATER_CRUST_BAND = 0.78;
 
     // ---- Shockwave tuning ----
-    private static final int SHOCKWAVE_TRAVEL_TICKS = 12;
-    private static final int SHOCKWAVE_MAX_AGE = 40;
-    private static final double SHOCKWAVE_PEAK_KNOCKBACK = 1.5;
+    private static final int SHOCKWAVE_TRAVEL_TICKS = 14;
+    private static final int SHOCKWAVE_MAX_AGE = 60;
+    private static final double SHOCKWAVE_PEAK_KNOCKBACK = 1.9;
     private static final double SHOCKWAVE_WALL_HEIGHT = 6.0;
+
+    /**
+     * Falloff exponent. 1.0 is linear; below 1.0 keeps the wave dangerous
+     * further out instead of fading to nothing halfway.
+     */
+    private static final double SHOCKWAVE_FALLOFF_EXPONENT = 0.6;
+
+    // ---- Ground ripple tuning ----
+    private static final double RIPPLE_RADIUS_FACTOR = 2.4;
+    private static final double RIPPLE_SPEED = 0.85;
+    private static final boolean RIPPLE_MOVES_BLOCKS = true;
+    private static final double RIPPLE_HOP_CHANCE = 0.30;
+    private static final int RIPPLE_MAX_BLOCKS = 70;
+
+    /** Beyond this, forced particles are not worth the packets. */
+    private static final double PARTICLE_SEND_DISTANCE = 160.0;
 
     // ---- Delayed boom tuning ----
     private static final double SPEED_OF_SOUND_BLOCKS_PER_TICK = 17.0;
@@ -87,6 +104,7 @@ public class TotaleCollapse implements ModInitializer {
 
     private static final List<Shockwave> ACTIVE_SHOCKWAVES = new ArrayList<>();
     private static final List<DelayedBoom> PENDING_BOOMS = new ArrayList<>();
+    private static final List<Ripple> ACTIVE_RIPPLES = new ArrayList<>();
 
     @Override
     public void onInitialize() {
@@ -160,6 +178,17 @@ public class TotaleCollapse implements ModInitializer {
                                             )
                             )
                             .then(
+                                    Commands.literal("shockwave")
+                                            .executes(context -> fireTestShockwave(context.getSource(), 9))
+                                            .then(
+                                                    Commands.argument("size", IntegerArgumentType.integer(1, 20))
+                                                            .executes(context -> fireTestShockwave(
+                                                                    context.getSource(),
+                                                                    IntegerArgumentType.getInteger(context, "size")
+                                                            ))
+                                            )
+                            )
+                            .then(
                                     Commands.literal("meteor")
                                             .executes(context -> {
                                                 ServerLevel level = context.getSource().getLevel();
@@ -194,6 +223,7 @@ public class TotaleCollapse implements ModInitializer {
             ACTIVE_STORMS.clear();
             ACTIVE_SHOCKWAVES.clear();
             PENDING_BOOMS.clear();
+            ACTIVE_RIPPLES.clear();
         });
     }
 
@@ -201,6 +231,7 @@ public class TotaleCollapse implements ModInitializer {
         tickStorms();
         tickMeteorGroups();
         tickShockwaves();
+        tickRipples();
         tickBooms();
     }
 
@@ -317,14 +348,14 @@ public class TotaleCollapse implements ModInitializer {
     }
 
     private static void spawnAtmosphericBreach(ServerLevel level, Vec3 pos, int meteorSize) {
-    level.sendParticles(ParticleTypes.SONIC_BOOM, pos.x, pos.y, pos.z, 1, 0.0, 0.0, 0.0, 0.0);
+    forceParticles(level, ParticleTypes.SONIC_BOOM, pos.x, pos.y, pos.z, 1, 0.0, 0.0, 0.0, 0.0);
 
     int ringPoints = 20 + meteorSize * 2;
     double ringRadius = meteorSize * 0.9;
 
     for (int i = 0; i < ringPoints; i++) {
         double angle = (Math.PI * 2.0 / ringPoints) * i;
-        level.sendParticles(
+        forceParticles(level,
                 ParticleTypes.CLOUD,
                 pos.x + Math.cos(angle) * ringRadius,
                 pos.y,
@@ -435,7 +466,7 @@ private static boolean willHitSomething(ServerLevel level, FallingBlockEntity me
     }
 
     private static void sendTrailParticles(ServerLevel level, Vec3 position) {
-        level.sendParticles(
+        forceParticles(level,
                 ParticleTypes.FLAME,
                 position.x,
                 position.y,
@@ -447,7 +478,7 @@ private static boolean willHitSomething(ServerLevel level, FallingBlockEntity me
                 0.02
         );
 
-        level.sendParticles(
+        forceParticles(level,
                 ParticleTypes.LARGE_SMOKE,
                 position.x,
                 position.y,
@@ -592,24 +623,24 @@ private static boolean willHitSomething(ServerLevel level, FallingBlockEntity me
     private static void triggerShockwave(ServerLevel level, Vec3 impact, int meteorSize) {
         double maxRadius = switch (meteorSize) {
             case 3 ->
-                12.0;
+                18.0;
             case 5 ->
-                20.0;
+                30.0;
             case 9 ->
-                32.0;
+                46.0;
             default ->
-                16.0;
+                22.0;
         };
 
         float peakDamage = switch (meteorSize) {
             case 3 ->
-                6.0F;
+                7.0F;
             case 5 ->
-                11.0F;
+                13.0F;
             case 9 ->
-                18.0F;
+                21.0F;
             default ->
-                8.0F;
+                9.0F;
         };
 
         ACTIVE_SHOCKWAVES.add(
@@ -623,7 +654,32 @@ private static boolean willHitSomething(ServerLevel level, FallingBlockEntity me
                 )
         );
 
+        // The flash at the moment of contact. FLASH is not usable here - in
+        // 1.21.11 it is a ParticleType<ColorParticleOption>, not a plain
+        // ParticleOptions, so a stacked EXPLOSION_EMITTER pair covers it.
+        forceParticles(level, ParticleTypes.SONIC_BOOM, impact.x, impact.y + 0.5, impact.z, 1, 0.0, 0.0, 0.0, 0.0);
+        forceParticles(level, ParticleTypes.EXPLOSION_EMITTER, impact.x, impact.y + 0.5, impact.z, 1, 0.0, 0.0, 0.0, 0.0);
+        forceParticles(level, ParticleTypes.EXPLOSION_EMITTER, impact.x, impact.y + 2.5, impact.z, 1, 1.5, 0.5, 1.5, 0.0);
+        forceParticles(level, ParticleTypes.EXPLOSION, impact.x, impact.y + 1.0, impact.z, 12, 2.0, 1.0, 2.0, 0.0);
+
+        spawnGroundRipple(level, impact, maxRadius);
         scheduleDistantBoom(level, impact, meteorSize);
+    }
+
+    /** Test entry point for {@code /collapse shockwave [size]}. */
+    private static int fireTestShockwave(net.minecraft.commands.CommandSourceStack source, int meteorSize) {
+        ServerLevel level = source.getLevel();
+        Vec3 origin = source.getPosition();
+
+        triggerShockwave(level, origin, meteorSize);
+
+        source.sendSuccess(
+                () -> Component.literal("Shockwave fired at " + String.format("%.1f %.1f %.1f", origin.x, origin.y, origin.z)
+                        + " (size " + meteorSize + ")"),
+                true
+        );
+
+        return Command.SINGLE_SUCCESS;
     }
 
     private static void tickShockwaves() {
@@ -645,7 +701,12 @@ private static boolean willHitSomething(ServerLevel level, FallingBlockEntity me
         }
     }
 
-    /** Draws the ring at terrain height so it hugs slopes instead of clipping. */
+    /**
+     * Draws the ring at terrain height so it hugs slopes instead of clipping
+     * through hills. Layered on purpose: a dust curtain for body, gusts for the
+     * pressure front, block debris so it picks up whatever it crosses, and
+     * flame plus explosion puffs at intervals for punch.
+     */
     private static void drawShockwaveRing(Shockwave wave, double inner, double outer) {
         double mid = (inner + outer) / 2.0;
 
@@ -653,14 +714,17 @@ private static boolean willHitSomething(ServerLevel level, FallingBlockEntity me
             return;
         }
 
-        int samples = Math.max(16, (int) (mid * 5.0));
+        int samples = Mth.clamp((int) (mid * 4.0), 24, 72);
         double fade = Math.max(0.0, 1.0 - mid / wave.maxRadius);
+        double trailing = mid * 0.78;
 
         for (int i = 0; i < samples; i++) {
             double angle = (Math.PI * 2.0 / samples) * i;
+            double cos = Math.cos(angle);
+            double sin = Math.sin(angle);
 
-            double x = wave.origin.x + Math.cos(angle) * mid;
-            double z = wave.origin.z + Math.sin(angle) * mid;
+            double x = wave.origin.x + cos * mid;
+            double z = wave.origin.z + sin * mid;
 
             int surface = wave.level.getHeight(
                     Heightmap.Types.MOTION_BLOCKING,
@@ -673,40 +737,56 @@ private static boolean willHitSomething(ServerLevel level, FallingBlockEntity me
                 continue;
             }
 
-            wave.level.sendParticles(
-                    ParticleTypes.CLOUD,
-                    x,
-                    surface + 0.2,
-                    z,
-                    1,
-                    0.12,
-                    0.02,
-                    0.12,
-                    0.02 + 0.05 * fade
-            );
+            double baseY = surface + 0.1;
 
-            if (i % 3 != 0) {
-                continue;
+            // Curtain of dust: three stacked layers, thinning with height.
+            forceParticles(wave.level, ParticleTypes.CLOUD, x, baseY + 0.2, z, 2, 0.16, 0.05, 0.16, 0.02 + 0.06 * fade);
+            forceParticles(wave.level, ParticleTypes.LARGE_SMOKE, x, baseY + 0.9, z, 1, 0.2, 0.25, 0.2, 0.01);
+
+            if (i % 2 == 0) {
+                forceParticles(wave.level, ParticleTypes.LARGE_SMOKE, x, baseY + 1.7, z, 1, 0.25, 0.3, 0.25, 0.01);
             }
 
-            BlockPos groundPos = BlockPos.containing(x, surface - 1.0, z);
-            BlockState ground = wave.level.getBlockState(groundPos);
-
-            if (ground.isAir()) {
-                continue;
+            // The pressure front itself.
+            if (i % 4 == 0) {
+                forceParticles(wave.level, ParticleTypes.GUST, x, baseY + 0.5, z, 1, 0.0, 0.0, 0.0, 0.0);
             }
 
-            wave.level.sendParticles(
-                    new BlockParticleOption(ParticleTypes.BLOCK, ground),
-                    x,
-                    surface + 0.1,
-                    z,
-                    2,
-                    0.15,
-                    0.05,
-                    0.15,
-                    0.05
-            );
+            // Debris torn from whatever the wave is crossing.
+            if (i % 3 == 0) {
+                BlockState ground = wave.level.getBlockState(BlockPos.containing(x, surface - 1.0, z));
+
+                if (!ground.isAir()) {
+                    forceParticles(
+                            wave.level,
+                            new BlockParticleOption(ParticleTypes.BLOCK, ground),
+                            x, baseY + 0.2, z, 3, 0.2, 0.1, 0.2, 0.12
+                    );
+                }
+            }
+
+            // Heat, only while the wave is still close and strong.
+            if (fade > 0.35 && i % 6 == 0) {
+                forceParticles(wave.level, ParticleTypes.FLAME, x, baseY + 0.4, z, 2, 0.15, 0.1, 0.15, 0.06);
+            }
+
+            if (fade > 0.5 && i % 12 == 0) {
+                forceParticles(wave.level, ParticleTypes.EXPLOSION, x, baseY + 0.8, z, 1, 0.0, 0.0, 0.0, 0.0);
+            }
+
+            // A fainter second ring chasing the first sells the depth.
+            if (trailing > 1.0 && i % 5 == 0) {
+                double tx = wave.origin.x + cos * trailing;
+                double tz = wave.origin.z + sin * trailing;
+
+                int trailSurface = wave.level.getHeight(
+                        Heightmap.Types.MOTION_BLOCKING,
+                        Mth.floor(tx),
+                        Mth.floor(tz)
+                );
+
+                forceParticles(wave.level, ParticleTypes.SMOKE, tx, trailSurface + 0.3, tz, 2, 0.2, 0.15, 0.2, 0.02);
+            }
         }
     }
 
@@ -714,15 +794,18 @@ private static boolean willHitSomething(ServerLevel level, FallingBlockEntity me
     private static void pushEntities(Shockwave wave, double inner, double outer) {
         AABB band = new AABB(
                 wave.origin.x - outer,
-                wave.origin.y - 4.0,
+                wave.origin.y - 6.0,
                 wave.origin.z - outer,
                 wave.origin.x + outer,
-                wave.origin.y + 6.0,
+                wave.origin.y + 8.0,
                 wave.origin.z + outer
         );
 
         for (LivingEntity entity : wave.level.getEntitiesOfClass(LivingEntity.class, band)) {
-            if (entity instanceof ServerPlayer player && (player.isSpectator() || player.isCreative())) {
+            // Spectators are untouchable. Creative players still get shoved,
+            // they just don't take the damage - otherwise testing in creative
+            // looks like the shockwave is doing nothing at all.
+            if (entity instanceof ServerPlayer player && player.isSpectator()) {
                 continue;
             }
 
@@ -739,19 +822,21 @@ private static boolean willHitSomething(ServerLevel level, FallingBlockEntity me
                 continue;
             }
 
-            double falloff = Math.max(0.0, 1.0 - distance / wave.maxRadius);
+            double linear = Math.max(0.0, 1.0 - distance / wave.maxRadius);
+            double falloff = Math.pow(linear, SHOCKWAVE_FALLOFF_EXPONENT);
 
             double nx = distance < 0.1 ? RANDOM.nextDouble() - 0.5 : dx / distance;
             double nz = distance < 0.1 ? RANDOM.nextDouble() - 0.5 : dz / distance;
 
             double push = wave.peakKnockback * falloff;
 
-            entity.push(nx * push, 0.15 + 0.35 * falloff, nz * push);
+            entity.push(nx * push, 0.20 + 0.40 * falloff, nz * push);
             entity.hurtMarked = true;
 
+            boolean damageImmune = entity instanceof ServerPlayer player && player.isCreative();
             float damage = (float) (wave.peakDamage * falloff);
 
-            if (damage >= 0.5F) {
+            if (!damageImmune && damage >= 0.5F) {
                 entity.hurtServer(
                         wave.level,
                         wave.level.damageSources().explosion(null, null),
@@ -767,11 +852,113 @@ private static boolean willHitSomething(ServerLevel level, FallingBlockEntity me
     }
 
     // ------------------------------------------------------------------
+    // Ground ripple
+    // ------------------------------------------------------------------
+    private static void spawnGroundRipple(ServerLevel level, Vec3 impact, double shockwaveRadius) {
+        ACTIVE_RIPPLES.add(new Ripple(level, impact, shockwaveRadius / RIPPLE_RADIUS_FACTOR));
+    }
+
+    private static void tickRipples() {
+        Iterator<Ripple> iterator = ACTIVE_RIPPLES.iterator();
+
+        while (iterator.hasNext()) {
+            Ripple ripple = iterator.next();
+
+            ripple.radius += RIPPLE_SPEED;
+
+            drawRipple(ripple);
+
+            if (ripple.radius >= ripple.maxRadius) {
+                iterator.remove();
+            }
+        }
+    }
+
+    /**
+     * A slow, tight secondary wave right around the impact. Unlike the
+     * shockwave this one physically hops the surface blocks upward, so the
+     * ground visibly ripples rather than just throwing particles.
+     */
+    private static void drawRipple(Ripple ripple) {
+        int samples = Mth.clamp((int) (ripple.radius * 8.0), 20, 64);
+
+        // Height of the visual crest, easing out as the ripple spreads.
+        double crest = 0.35 * Math.max(0.0, 1.0 - ripple.radius / ripple.maxRadius);
+
+        for (int i = 0; i < samples; i++) {
+            double angle = (Math.PI * 2.0 / samples) * i;
+
+            double x = ripple.origin.x + Math.cos(angle) * ripple.radius;
+            double z = ripple.origin.z + Math.sin(angle) * ripple.radius;
+
+            int surfaceY = ripple.level.getHeight(
+                    Heightmap.Types.MOTION_BLOCKING,
+                    Mth.floor(x),
+                    Mth.floor(z)
+            );
+
+            double y = surfaceY + 0.05 + crest;
+
+            forceParticles(ripple.level, ParticleTypes.CLOUD, x, y, z, 1, 0.08, 0.02, 0.08, 0.01);
+
+            BlockPos surfacePos = BlockPos.containing(x, surfaceY - 1.0, z);
+            BlockState surface = ripple.level.getBlockState(surfacePos);
+
+            if (surface.isAir()) {
+                continue;
+            }
+
+            if (i % 2 == 0) {
+                forceParticles(
+                        ripple.level,
+                        new BlockParticleOption(ParticleTypes.BLOCK, surface),
+                        x, surfaceY + 0.1, z, 2, 0.12, 0.02, 0.12, 0.08
+                );
+            }
+
+            if (!RIPPLE_MOVES_BLOCKS
+                    || ripple.blocksMoved >= RIPPLE_MAX_BLOCKS
+                    || RANDOM.nextDouble() > RIPPLE_HOP_CHANCE) {
+                continue;
+            }
+
+            if (!canHop(ripple.level, surfacePos, surface)) {
+                continue;
+            }
+
+            // fall() lifts the block out and re-places it when it lands, which
+            // is exactly the pop-and-settle we want.
+            FallingBlockEntity hop = FallingBlockEntity.fall(ripple.level, surfacePos, surface);
+
+            hop.dropItem = false;
+            hop.setDeltaMovement(0.0, 0.16 + RANDOM.nextDouble() * 0.14, 0.0);
+
+            ripple.blocksMoved++;
+        }
+    }
+
+    /** Only hop plain, full, breakable blocks - never containers or fluids. */
+    private static boolean canHop(ServerLevel level, BlockPos pos, BlockState state) {
+        if (state.hasBlockEntity() || !state.getFluidState().isEmpty()) {
+            return false;
+        }
+
+        if (!state.isCollisionShapeFullBlock(level, pos)) {
+            return false;
+        }
+
+        if (!level.getBlockState(pos.above()).isAir()) {
+            return false;
+        }
+
+        return isCarvable(level, pos);
+    }
+
+    // ------------------------------------------------------------------
     // Delayed, distance-based boom
     // ------------------------------------------------------------------
     private static void scheduleDistantBoom(ServerLevel level, Vec3 impact, int meteorSize) {
-        float volume = 3.0F + meteorSize * 0.5F;
-        float pitch = Math.max(0.4F, 1.1F - meteorSize * 0.06F);
+        float pitch = Math.max(0.4F, 1.05F - meteorSize * 0.05F);
 
         for (ServerPlayer player : level.players()) {
             double distance = Math.sqrt(player.distanceToSqr(impact));
@@ -783,13 +970,11 @@ private static boolean willHitSomething(ServerLevel level, FallingBlockEntity me
             int delay = (int) (distance / SPEED_OF_SOUND_BLOCKS_PER_TICK);
 
             if (delay <= 0) {
-                playBoom(player, impact, volume, pitch);
+                playBoom(player, impact, pitch);
                 continue;
             }
 
-            PENDING_BOOMS.add(
-                    new DelayedBoom(player.getUUID(), level, impact, delay, volume, pitch)
-            );
+            PENDING_BOOMS.add(new DelayedBoom(player.getUUID(), level, impact, delay, pitch));
         }
     }
 
@@ -806,25 +991,52 @@ private static boolean willHitSomething(ServerLevel level, FallingBlockEntity me
             ServerPlayer player = boom.level.getServer().getPlayerList().getPlayer(boom.playerId);
 
             if (player != null) {
-                playBoom(player, boom.impact, boom.volume, boom.pitch);
+                playBoom(player, boom.impact, boom.pitch);
             }
 
             iterator.remove();
         }
     }
 
-    private static void playBoom(ServerPlayer player, Vec3 impact, float volume, float pitch) {
-        Holder<SoundEvent> sound = SoundEvents.GENERIC_EXPLODE;
+    /**
+     * Plays the boom at the listener's own position rather than at the impact.
+     * Minecraft's audible radius is volume x 16 blocks, and volume above 1.0
+     * only widens that radius without adding loudness - so an impact 150 blocks
+     * out played at its real coordinates is silent or nearly so. Emitting it on
+     * the player and scaling volume by distance is how vanilla handles thunder.
+     */
+    private static void playBoom(ServerPlayer player, Vec3 impact, float basePitch) {
+        double distance = Math.sqrt(player.distanceToSqr(impact));
+        double nearness = 1.0 - Math.min(1.0, distance / MAX_BOOM_DISTANCE);
+
+        float volume = (float) (0.25 + 0.75 * nearness);
+        float pitch = Math.max(0.35F, basePitch - (float) ((1.0 - nearness) * 0.45));
+
+        Vec3 ear = player.position();
 
         player.connection.send(
                 new ClientboundSoundPacket(
-                        sound,
+                        SoundEvents.GENERIC_EXPLODE,
                         SoundSource.BLOCKS,
-                        impact.x,
-                        impact.y,
-                        impact.z,
+                        ear.x,
+                        ear.y,
+                        ear.z,
                         volume,
                         pitch,
+                        RANDOM.nextLong()
+                )
+        );
+
+        // A second, much lower layer gives the distant rumble some body.
+        player.connection.send(
+                new ClientboundSoundPacket(
+                        SoundEvents.GENERIC_EXPLODE,
+                        SoundSource.BLOCKS,
+                        ear.x,
+                        ear.y,
+                        ear.z,
+                        volume * 0.85F,
+                        Math.max(0.25F, pitch * 0.45F),
                         RANDOM.nextLong()
                 )
         );
@@ -836,7 +1048,7 @@ private static boolean willHitSomething(ServerLevel level, FallingBlockEntity me
                 Blocks.MAGMA_BLOCK.defaultBlockState()
         );
 
-        level.sendParticles(
+        forceParticles(level,
                 dustPillar,
                 position.x,
                 position.y,
@@ -848,7 +1060,7 @@ private static boolean willHitSomething(ServerLevel level, FallingBlockEntity me
                 0.12
         );
 
-        level.sendParticles(
+        forceParticles(level,
                 ParticleTypes.FLAME,
                 position.x,
                 position.y,
@@ -860,7 +1072,7 @@ private static boolean willHitSomething(ServerLevel level, FallingBlockEntity me
                 0.14
         );
 
-        level.sendParticles(
+        forceParticles(level,
                 ParticleTypes.LARGE_SMOKE,
                 position.x,
                 position.y,
@@ -871,6 +1083,38 @@ private static boolean willHitSomething(ServerLevel level, FallingBlockEntity me
                 1.6,
                 0.10
         );
+    }
+
+    /**
+     * Sends a particle to every player with force = true.
+     * The plain sendParticles(...) overload uses force = false, which the server
+     * clamps to a 32-block radius - that is why effects on meteors spawned 30-60
+     * blocks up and 25-150 blocks out were invisible. Forcing extends the range
+     * to 512 blocks and makes the particle show even on the "Minimal" setting.
+     * Players past PARTICLE_SEND_DISTANCE are skipped so a full storm doesn't
+     * flood the network with particles nobody can resolve anyway.
+     */
+    private static <T extends ParticleOptions> void forceParticles(
+            ServerLevel level,
+            T type,
+            double x,
+            double y,
+            double z,
+            int count,
+            double spreadX,
+            double spreadY,
+            double spreadZ,
+            double speed
+    ) {
+        double cutoffSquared = PARTICLE_SEND_DISTANCE * PARTICLE_SEND_DISTANCE;
+
+        for (ServerPlayer player : level.players()) {
+            if (player.distanceToSqr(x, y, z) > cutoffSquared) {
+                continue;
+            }
+
+            level.sendParticles(player, type, true, true, x, y, z, count, spreadX, spreadY, spreadZ, speed);
+        }
     }
 
     private static final class Shockwave {
@@ -910,7 +1154,6 @@ private static boolean willHitSomething(ServerLevel level, FallingBlockEntity me
         private final UUID playerId;
         private final ServerLevel level;
         private final Vec3 impact;
-        private final float volume;
         private final float pitch;
 
         private int ticksRemaining;
@@ -920,15 +1163,31 @@ private static boolean willHitSomething(ServerLevel level, FallingBlockEntity me
                 ServerLevel level,
                 Vec3 impact,
                 int ticksRemaining,
-                float volume,
                 float pitch
         ) {
             this.playerId = playerId;
             this.level = level;
             this.impact = impact;
             this.ticksRemaining = ticksRemaining;
-            this.volume = volume;
             this.pitch = pitch;
+        }
+    }
+
+    private static final class Ripple {
+
+        private final ServerLevel level;
+        private final Vec3 origin;
+        private final double maxRadius;
+
+        private double radius;
+        private int blocksMoved;
+
+        private Ripple(ServerLevel level, Vec3 origin, double maxRadius) {
+            this.level = level;
+            this.origin = origin;
+            this.maxRadius = maxRadius;
+            this.radius = 0.5;
+            this.blocksMoved = 0;
         }
     }
 

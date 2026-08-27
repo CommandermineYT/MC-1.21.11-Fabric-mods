@@ -12,6 +12,8 @@ import org.slf4j.LoggerFactory;
 
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.protocol.game.ClientboundSetCameraPacket;
+import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
+import net.minecraft.network.protocol.game.ServerboundPlayerInputPacket;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Entity;
@@ -19,27 +21,27 @@ import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
 import net.minecraft.world.entity.MoverType;
 import net.minecraft.world.entity.monster.Enemy;
+import net.minecraft.world.entity.player.Input;
 import net.minecraft.world.level.GameType;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
-import net.minecraft.network.protocol.game.ServerboundPlayerInputPacket;
 
 public final class MindControlManager {
 
     private static final Logger LOGGER =
             LoggerFactory.getLogger("totale-collapse-mindcontrol");
 
-    private static final Set<UUID> AWAITING_TARGET = new HashSet<>();
+    private static final Set<UUID> AWAITING_TARGET =
+            new HashSet<>();
 
-    private static final Map<UUID, Possession> ACTIVE = new HashMap<>();
+    private static final Map<UUID, Possession> ACTIVE =
+            new HashMap<>();
 
-    private static final Set<UUID> POSSESSED_ENTITY_IDS = new HashSet<>();
+    private static final Set<UUID> POSSESSED_ENTITY_IDS =
+            new HashSet<>();
 
     private static final double HOSTILE_PROTECTION_RADIUS = 48.0;
 
-    /*
-     * Movement settings.
-     */
     private static final double WALK_SPEED = 0.22;
     private static final double SPRINT_SPEED = 0.32;
     private static final double JUMP_VELOCITY = 0.42;
@@ -48,41 +50,9 @@ public final class MindControlManager {
     private MindControlManager() {
     }
 
-    // -------------------------------------------------------------------------
-    // INPUT
-    // -------------------------------------------------------------------------
-
-    /**
-     * Called whenever the player sends a movement-input packet.
-     *
-     * This is the important part: on modern Minecraft versions the server
-     * receives WASD/jump input through ServerboundPlayerInputPacket rather
-     * than us simply relying on player.xxa/player.zza.
-     */
-    public static void handleInput(
-            ServerPlayer player,
-            float strafe,
-            float forward,
-            boolean jumping,
-            boolean sneaking
-    ) {
-        Possession possession = ACTIVE.get(player.getUUID());
-
-        if (possession == null) {
-            return;
-        }
-
-        possession.setInput(
-                strafe,
-                forward,
-                jumping,
-                sneaking
-        );
-    }
-
-    // -------------------------------------------------------------------------
-    // START
-    // -------------------------------------------------------------------------
+    // ========================================================================
+    // TARGET SELECTION
+    // ========================================================================
 
     public static void beginAwaitingTarget(ServerPlayer player) {
         UUID id = player.getUUID();
@@ -111,9 +81,98 @@ public final class MindControlManager {
                 && POSSESSED_ENTITY_IDS.contains(entity.getUUID());
     }
 
-    // -------------------------------------------------------------------------
-    // POSSESS
-    // -------------------------------------------------------------------------
+    // ========================================================================
+    // PLAYER INPUT PACKET
+    // ========================================================================
+
+    public static void handleInputPacket(
+            ServerPlayer player,
+            ServerboundPlayerInputPacket packet
+    ) {
+        Possession possession =
+                ACTIVE.get(player.getUUID());
+
+        if (possession == null) {
+            return;
+        }
+
+        Input input = packet.input();
+
+        possession.setInput(
+                input.forward(),
+                input.backward(),
+                input.left(),
+                input.right(),
+                input.jump(),
+                input.shift(),
+                input.sprint()
+        );
+    }
+
+    // ========================================================================
+    // PLAYER ROTATION PACKET
+    // ========================================================================
+
+    public static void handleRotationPacket(
+            ServerPlayer player,
+            ServerboundMovePlayerPacket packet
+    ) {
+        Possession possession =
+                ACTIVE.get(player.getUUID());
+
+        if (possession == null) {
+            return;
+        }
+
+        /*
+         * Only process packets that actually contain a rotation.
+         */
+        if (!packet.hasRotation()) {
+            return;
+        }
+
+        /*
+         * getYRot/getXRot take the current value as a fallback.
+         */
+        float yaw =
+                packet.getYRot(
+                        possession.yaw()
+                );
+
+        float pitch =
+                packet.getXRot(
+                        possession.pitch()
+                );
+
+        /*
+         * Clamp pitch.
+         */
+        pitch = Math.max(
+                -90.0F,
+                Math.min(
+                        90.0F,
+                        pitch
+                )
+        );
+
+        possession.setRotation(
+                yaw,
+                pitch
+        );
+
+        /*
+         * Also keep the server-side player rotation synchronized.
+         * This is useful because the spectator camera originates from
+         * this player's client.
+         */
+        player.setYRot(yaw);
+        player.setXRot(pitch);
+        player.setYHeadRot(yaw);
+    }
+
+    // ========================================================================
+    // START POSSESSION
+    // ========================================================================
 
     public static void tryPossess(
             ServerPlayer player,
@@ -146,7 +205,9 @@ public final class MindControlManager {
             return;
         }
 
-        if (POSSESSED_ENTITY_IDS.contains(livingTarget.getUUID())) {
+        if (POSSESSED_ENTITY_IDS.contains(
+                livingTarget.getUUID()
+        )) {
             player.sendSystemMessage(Component.literal(
                     "That entity is already being controlled."
             ));
@@ -157,20 +218,28 @@ public final class MindControlManager {
                 player.gameMode.getGameModeForPlayer();
 
         boolean previousNoAi =
-                livingTarget instanceof Mob mob && mob.isNoAi();
+                livingTarget instanceof Mob mob
+                        && mob.isNoAi();
 
-        Possession possession = new Possession(
+        Possession possession =
+                new Possession(
+                        id,
+                        livingTarget,
+                        previousMode,
+                        previousNoAi
+                );
+
+        ACTIVE.put(
                 id,
-                livingTarget,
-                previousMode,
-                previousNoAi
+                possession
         );
 
-        ACTIVE.put(id, possession);
-        POSSESSED_ENTITY_IDS.add(livingTarget.getUUID());
+        POSSESSED_ENTITY_IDS.add(
+                livingTarget.getUUID()
+        );
 
         /*
-         * Disable mob AI while we directly control it.
+         * Disable mob AI.
          */
         if (livingTarget instanceof Mob mob) {
             mob.setNoAi(true);
@@ -179,25 +248,33 @@ public final class MindControlManager {
         }
 
         /*
-         * Spectator is useful here because it stops the real player entity
-         * from interfering with the possessed entity.
+         * Spectator allows the player camera to follow the entity.
          */
-        player.gameMode.changeGameModeForPlayer(GameType.SPECTATOR);
-
-        /*
-         * Start the camera on the possessed entity.
-         */
-        player.connection.send(
-                new ClientboundSetCameraPacket(livingTarget)
+        player.gameMode.changeGameModeForPlayer(
+                GameType.SPECTATOR
         );
 
         /*
-         * Immediately synchronize rotation.
+         * Set the camera to the possessed entity.
          */
-        livingTarget.setYRot(player.getYRot());
-        livingTarget.setYHeadRot(player.getYRot());
-        livingTarget.setYBodyRot(player.getYRot());
-        livingTarget.setXRot(player.getXRot());
+        player.connection.send(
+                new ClientboundSetCameraPacket(
+                        livingTarget
+                )
+        );
+
+        /*
+         * Start with the player's current camera rotation.
+         */
+        possession.setRotation(
+                player.getYRot(),
+                player.getXRot()
+        );
+
+        applyRotation(
+                possession,
+                livingTarget
+        );
 
         player.sendSystemMessage(Component.literal(
                 "Mind controlling "
@@ -212,9 +289,9 @@ public final class MindControlManager {
         );
     }
 
-    // -------------------------------------------------------------------------
+    // ========================================================================
     // STOP
-    // -------------------------------------------------------------------------
+    // ========================================================================
 
     public static void stop(ServerPlayer player) {
         UUID id = player.getUUID();
@@ -226,15 +303,21 @@ public final class MindControlManager {
                 ACTIVE.remove(id);
 
         if (possession != null) {
+
             POSSESSED_ENTITY_IDS.remove(
                     possession.target().getUUID()
             );
 
-            release(player, possession);
+            release(
+                    player,
+                    possession
+            );
 
             player.sendSystemMessage(Component.literal(
                     "Released control of "
-                            + possession.target().getName().getString()
+                            + possession.target()
+                            .getName()
+                            .getString()
                             + "."
             ));
 
@@ -253,77 +336,95 @@ public final class MindControlManager {
         ));
     }
 
-    // -------------------------------------------------------------------------
+    // ========================================================================
     // RELEASE
-    // -------------------------------------------------------------------------
+    // ========================================================================
 
     private static void release(
             ServerPlayer player,
             Possession possession
     ) {
-        LivingEntity target = possession.target();
+        LivingEntity target =
+                possession.target();
 
-        /*
-         * Restore the mob's previous AI state.
-         */
-        if (target.isAlive() && target instanceof Mob mob) {
-            mob.setNoAi(possession.previousNoAi());
+        if (target.isAlive()
+                && target instanceof Mob mob) {
+
+            mob.setNoAi(
+                    possession.previousNoAi()
+            );
+
+            mob.setTarget(null);
         }
 
         /*
-         * Put the camera back onto the player.
+         * Put camera back on player.
          */
         player.connection.send(
-                new ClientboundSetCameraPacket(player)
+                new ClientboundSetCameraPacket(
+                        player
+                )
         );
 
         /*
-         * Restore the player's original gamemode.
+         * Restore original gamemode.
          */
         player.gameMode.changeGameModeForPlayer(
                 possession.previousMode()
         );
 
-        /*
-         * Reset player movement.
-         */
-        player.setDeltaMovement(Vec3.ZERO);
+        player.setDeltaMovement(
+                Vec3.ZERO
+        );
     }
 
-    // -------------------------------------------------------------------------
+    // ========================================================================
     // DISCONNECT
-    // -------------------------------------------------------------------------
+    // ========================================================================
 
-    public static void handleDisconnect(ServerPlayer player) {
-        UUID playerId = player.getUUID();
+    public static void handleDisconnect(
+            ServerPlayer player
+    ) {
+        UUID playerId =
+                player.getUUID();
 
-        AWAITING_TARGET.remove(playerId);
+        AWAITING_TARGET.remove(
+                playerId
+        );
 
         Possession possession =
-                ACTIVE.remove(playerId);
+                ACTIVE.remove(
+                        playerId
+                );
 
         if (possession == null) {
             return;
         }
 
-        LivingEntity target = possession.target();
+        LivingEntity target =
+                possession.target();
 
         POSSESSED_ENTITY_IDS.remove(
                 target.getUUID()
         );
 
-        if (target.isAlive() && target instanceof Mob mob) {
+        if (target.isAlive()
+                && target instanceof Mob mob) {
+
             mob.setNoAi(
                     possession.previousNoAi()
             );
+
+            mob.setTarget(null);
         }
     }
 
-    // -------------------------------------------------------------------------
-    // TICK
-    // -------------------------------------------------------------------------
+    // ========================================================================
+    // SERVER TICK
+    // ========================================================================
 
     public static void tick() {
+
         Iterator<Map.Entry<UUID, Possession>> iterator =
                 ACTIVE.entrySet().iterator();
 
@@ -341,10 +442,14 @@ public final class MindControlManager {
             /*
              * Player disappeared or entity died.
              */
-            if (player == null || !target.isAlive()) {
+            if (player == null
+                    || !target.isAlive()) {
 
                 if (player != null) {
-                    release(player, possession);
+                    release(
+                            player,
+                            possession
+                    );
                 }
 
                 POSSESSED_ENTITY_IDS.remove(
@@ -352,112 +457,167 @@ public final class MindControlManager {
                 );
 
                 iterator.remove();
+
                 continue;
             }
 
             /*
-             * Make absolutely sure the client camera stays attached.
+             * Keep the actual player stationary.
              */
-            player.connection.send(
-                    new ClientboundSetCameraPacket(target)
+            player.setDeltaMovement(
+                    Vec3.ZERO
             );
 
             /*
-             * The real player should not physically move while possessing.
+             * Apply camera rotation to the entity.
              */
-            player.setDeltaMovement(Vec3.ZERO);
+            applyRotation(
+                    possession,
+                    target
+            );
 
             /*
-             * The player's mouse controls the possessed entity.
+             * Apply WASD movement.
              */
-            updateRotation(player, target);
+            updateMovement(
+                    possession,
+                    target
+            );
 
             /*
-             * WASD / jump controls the possessed entity.
+             * Stop hostile mobs targeting the possessed entity.
              */
-            updateMovement(player, possession, target);
-
-            /*
-             * Stop hostile mobs attacking the thing we're controlling.
-             */
-            protectFromHostiles(target);
+            protectFromHostiles(
+                    target
+            );
         }
     }
 
-    // -------------------------------------------------------------------------
+    // ========================================================================
     // ROTATION
-    // -------------------------------------------------------------------------
+    // ========================================================================
 
-    private static void updateRotation(
-            ServerPlayer player,
-            LivingEntity target
-    ) {
-        float yaw = player.getYRot();
-        float pitch = player.getXRot();
-
-        /*
-         * Clamp pitch to normal Minecraft camera limits.
-         */
-        pitch = Math.max(-90.0F, Math.min(90.0F, pitch));
-
-        target.setYRot(yaw);
-        target.setYHeadRot(yaw);
-        target.setYBodyRot(yaw);
-        target.setXRot(pitch);
-    }
-
-    // -------------------------------------------------------------------------
-    // MOVEMENT
-    // -------------------------------------------------------------------------
-
-    private static void updateMovement(
-            ServerPlayer player,
+    private static void applyRotation(
             Possession possession,
             LivingEntity target
     ) {
-        float forward = possession.forward();
-        float strafe = possession.strafe();
+        float yaw =
+                possession.yaw();
+
+        float pitch =
+                possession.pitch();
+
+        pitch = Math.max(
+                -90.0F,
+                Math.min(
+                        90.0F,
+                        pitch
+                )
+        );
 
         /*
-         * Sneaking slightly slows movement.
+         * Main body rotation.
          */
-        double speed = possession.sneaking()
-                ? WALK_SPEED * 0.3
-                : WALK_SPEED;
+        target.setYRot(yaw);
 
         /*
-         * Use the player's sprint state for faster movement.
+         * Head rotation.
          */
-        if (player.isSprinting() && !possession.sneaking()) {
-            speed = SPRINT_SPEED;
+        target.setYHeadRot(yaw);
+
+        /*
+         * Looking up/down.
+         */
+        target.setXRot(pitch);
+
+        /*
+         * Mobs have a separate body rotation.
+         */
+        if (target instanceof Mob mob) {
+            mob.setYBodyRot(yaw);
+        }
+    }
+
+    // ========================================================================
+    // MOVEMENT
+    // ========================================================================
+
+    private static void updateMovement(
+            Possession possession,
+            LivingEntity target
+    ) {
+        double forward = 0.0;
+        double strafe = 0.0;
+
+        /*
+         * W
+         */
+        if (possession.forward()) {
+            forward += 1.0;
         }
 
         /*
-         * Calculate direction based on camera yaw.
+         * S
          */
-        double yawRadians =
-                Math.toRadians(target.getYRot());
-
-        double sin =
-                Math.sin(yawRadians);
-
-        double cos =
-                Math.cos(yawRadians);
+        if (possession.backward()) {
+            forward -= 1.0;
+        }
 
         /*
-         * Forward/backward.
+         * A
          */
+        if (possession.left()) {
+            strafe += 1.0;
+        }
+
+        /*
+         * D
+         */
+        if (possession.right()) {
+            strafe -= 1.0;
+        }
+
+        /*
+         * Speed.
+         */
+        double speed =
+                WALK_SPEED;
+
+        if (possession.sneaking()) {
+            speed *= 0.3;
+        }
+
+        if (possession.sprinting()) {
+            speed =
+                    SPRINT_SPEED;
+        }
+
+        /*
+         * Convert movement to world coordinates using
+         * the possessed entity's yaw.
+         */
+        double yaw =
+                Math.toRadians(
+                        possession.yaw()
+                );
+
+        double sin =
+                Math.sin(yaw);
+
+        double cos =
+                Math.cos(yaw);
+
         double moveX =
                 -sin * forward;
 
         double moveZ =
                 cos * forward;
 
-        /*
-         * Left/right.
-         */
-        moveX += cos * strafe;
-        moveZ += sin * strafe;
+        moveX +=
+                cos * strafe;
+
+        moveZ +=
+                sin * strafe;
 
         /*
          * Normalize diagonal movement.
@@ -469,18 +629,24 @@ public final class MindControlManager {
                 );
 
         if (length > 1.0E-4) {
-            moveX /= length;
-            moveZ /= length;
+
+            moveX /=
+                    length;
+
+            moveZ /=
+                    length;
+
         } else {
+
             moveX = 0.0;
             moveZ = 0.0;
         }
 
-        Vec3 velocity =
-                target.getDeltaMovement();
-
+        /*
+         * Vertical velocity.
+         */
         double verticalVelocity =
-                velocity.y;
+                target.getDeltaMovement().y;
 
         /*
          * Jump.
@@ -498,77 +664,67 @@ public final class MindControlManager {
         if (!target.onGround()
                 && !target.isNoGravity()) {
 
-            verticalVelocity -= GRAVITY;
+            verticalVelocity -=
+                    GRAVITY;
         }
 
         /*
-         * Prevent ridiculous falling speeds.
+         * Maximum falling velocity.
          */
         if (verticalVelocity < -3.92) {
-            verticalVelocity = -3.92;
+            verticalVelocity =
+                    -3.92;
         }
 
         /*
-         * Horizontal movement.
+         * Horizontal velocity.
          */
-        double horizontalX =
+        double velocityX =
                 moveX * speed;
 
-        double horizontalZ =
+        double velocityZ =
                 moveZ * speed;
 
         /*
-         * Apply air drag when there is no input.
-         *
-         * This gives a more natural stop rather than instantly
-         * snapping to zero.
+         * Friction when no movement key is held.
          */
-        if (forward == 0.0F
-                && strafe == 0.0F) {
+        if (forward == 0.0
+                && strafe == 0.0) {
 
-            horizontalX *= 0.65;
-            horizontalZ *= 0.65;
+            velocityX *= 0.65;
+            velocityZ *= 0.65;
         }
 
-        Vec3 newVelocity =
+        Vec3 movement =
                 new Vec3(
-                        horizontalX,
+                        velocityX,
                         verticalVelocity,
-                        horizontalZ
+                        velocityZ
                 );
 
-        target.setDeltaMovement(newVelocity);
-
-        /*
-         * Let Minecraft's collision system handle the actual movement.
-         */
-        target.move(
-                MoverType.SELF,
-                newVelocity
+        target.setDeltaMovement(
+                movement
         );
 
         /*
-         * Keep the entity's body facing the camera.
+         * Vanilla collision movement.
          */
-        target.setYRot(player.getYRot());
-        target.setYHeadRot(player.getYRot());
-
-        if (target instanceof Mob mob) {
-            mob.setYBodyRot(player.getYRot());
-        }
-
-        target.setXRot(player.getXRot());
+        target.move(
+                MoverType.SELF,
+                movement
+        );
     }
 
-    // -------------------------------------------------------------------------
+    // ========================================================================
     // HOSTILE PROTECTION
-    // -------------------------------------------------------------------------
+    // ========================================================================
 
     private static void protectFromHostiles(
             LivingEntity target
     ) {
         if (!(target.level()
                 instanceof ServerLevel serverLevel)) {
+
             return;
         }
 
@@ -584,14 +740,14 @@ public final class MindControlManager {
                 mob ->
                         mob instanceof Enemy
                                 && mob.getTarget() == target
-        ).forEach(mob ->
-                mob.setTarget(null)
+        ).forEach(
+                mob -> mob.setTarget(null)
         );
     }
 
-    // -------------------------------------------------------------------------
+    // ========================================================================
     // POSSESSION DATA
-    // -------------------------------------------------------------------------
+    // ========================================================================
 
     private static final class Possession {
 
@@ -604,15 +760,21 @@ public final class MindControlManager {
         private final boolean previousNoAi;
 
         /*
-         * Latest client input.
+         * Keyboard input.
          */
-        private float strafe;
-
-        private float forward;
-
+        private boolean forward;
+        private boolean backward;
+        private boolean left;
+        private boolean right;
         private boolean jumping;
-
         private boolean sneaking;
+        private boolean sprinting;
+
+        /*
+         * Camera rotation.
+         */
+        private float yaw;
+        private float pitch;
 
         private Possession(
                 UUID playerId,
@@ -620,11 +782,28 @@ public final class MindControlManager {
                 GameType previousMode,
                 boolean previousNoAi
         ) {
-            this.playerId = playerId;
-            this.target = target;
-            this.previousMode = previousMode;
-            this.previousNoAi = previousNoAi;
+            this.playerId =
+                    playerId;
+
+            this.target =
+                    target;
+
+            this.previousMode =
+                    previousMode;
+
+            this.previousNoAi =
+                    previousNoAi;
+
+            this.yaw =
+                    target.getYRot();
+
+            this.pitch =
+                    target.getXRot();
         }
+
+        // --------------------------------------------------------------------
+        // ENTITY
+        // --------------------------------------------------------------------
 
         private LivingEntity target() {
             return target;
@@ -638,12 +817,55 @@ public final class MindControlManager {
             return previousNoAi;
         }
 
-        private float strafe() {
-            return strafe;
+        // --------------------------------------------------------------------
+        // INPUT
+        // --------------------------------------------------------------------
+
+        private void setInput(
+                boolean forward,
+                boolean backward,
+                boolean left,
+                boolean right,
+                boolean jumping,
+                boolean sneaking,
+                boolean sprinting
+        ) {
+            this.forward =
+                    forward;
+
+            this.backward =
+                    backward;
+
+            this.left =
+                    left;
+
+            this.right =
+                    right;
+
+            this.jumping =
+                    jumping;
+
+            this.sneaking =
+                    sneaking;
+
+            this.sprinting =
+                    sprinting;
         }
 
-        private float forward() {
+        private boolean forward() {
             return forward;
+        }
+
+        private boolean backward() {
+            return backward;
+        }
+
+        private boolean left() {
+            return left;
+        }
+
+        private boolean right() {
+            return right;
         }
 
         private boolean jumping() {
@@ -654,26 +876,48 @@ public final class MindControlManager {
             return sneaking;
         }
 
-        private void setInput(
-                float strafe,
-                float forward,
-                boolean jumping,
-                boolean sneaking
-        ) {
-            this.strafe = strafe;
-            this.forward = forward;
-            this.jumping = jumping;
-            this.sneaking = sneaking;
+        private boolean sprinting() {
+            return sprinting;
         }
 
+        // --------------------------------------------------------------------
+        // ROTATION
+        // --------------------------------------------------------------------
+
+        private void setRotation(
+                float yaw,
+                float pitch
+        ) {
+            this.yaw =
+                    yaw;
+
+            this.pitch =
+                    pitch;
+        }
+
+        private float yaw() {
+            return yaw;
+        }
+
+        private float pitch() {
+            return pitch;
+        }
+
+        // --------------------------------------------------------------------
+        // PLAYER
+        // --------------------------------------------------------------------
+
         private ServerPlayer resolvePlayer() {
+
             if (target.level()
                     instanceof ServerLevel serverLevel) {
 
                 return serverLevel
                         .getServer()
                         .getPlayerList()
-                        .getPlayer(playerId);
+                        .getPlayer(
+                                playerId
+                        );
             }
 
             return null;
