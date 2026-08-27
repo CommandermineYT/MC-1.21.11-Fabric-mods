@@ -12,9 +12,9 @@ import org.slf4j.LoggerFactory;
 
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.protocol.game.ClientboundSetCameraPacket;
-import net.minecraft.util.Mth;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.util.Mth;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.Mob;
@@ -109,6 +109,10 @@ public final class MindControlManager {
                 input.sprint()
         );
 
+        /*
+         * Read rotation from the PLAYER, not the target.
+         * Mouse input updates the player's yaw/pitch even in spectator mode.
+         */
         float yaw =
                 player.getYRot();
 
@@ -225,11 +229,11 @@ public final class MindControlManager {
         );
 
         /*
-         * Start with the player's current camera rotation.
+         * Start with the entity's current rotation.
          */
         possession.setRotation(
-                player.getYRot(),
-                player.getXRot()
+                livingTarget.getYRot(),
+                livingTarget.getXRot()
         );
 
         applyRotation(
@@ -457,6 +461,14 @@ public final class MindControlManager {
             );
 
             /*
+             * Force-sync rotation to all clients every tick.
+             * This ensures spectator camera moves instantly with mouse input.
+             */
+            syncRotationToClients(
+                    target
+            );
+
+            /*
              * Apply WASD movement.
              */
             updateMovement(
@@ -476,6 +488,34 @@ public final class MindControlManager {
     // ========================================================================
     // ROTATION
     // ========================================================================
+
+    /**
+     * Sync the entity's rotation to all clients tracking it.
+     * This ensures the spectator camera immediately reflects mouse input.
+     */
+    private static void syncRotationToClients(
+            LivingEntity target
+    ) {
+        if (!(target.level() instanceof ServerLevel serverLevel)) {
+            return;
+        }
+
+        /*
+         * Convert yaw to byte (0-255 range).
+         */
+        byte headYaw = (byte) ((int) (target.getYHeadRot() * 256.0F / 360.0F) & 255);
+
+        /*
+         * Send rotation packet to all players.
+         * In this Minecraft version, the packet constructor accepts the entity
+         * instance directly rather than its numeric ID.
+         */
+        var rotationPacket = new net.minecraft.network.protocol.game.ClientboundRotateHeadPacket(
+                target,
+                headYaw
+        );
+        serverLevel.getServer().getPlayerList().broadcastAll(rotationPacket);
+    }
 
     private static void applyRotation(
             Possession possession,
