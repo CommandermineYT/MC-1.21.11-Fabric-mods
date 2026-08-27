@@ -12,8 +12,7 @@ import org.slf4j.LoggerFactory;
 
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.protocol.game.ClientboundSetCameraPacket;
-import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
-import net.minecraft.network.protocol.game.ServerboundPlayerInputPacket;
+import net.minecraft.util.Mth;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.Entity;
@@ -82,21 +81,23 @@ public final class MindControlManager {
     }
 
     // ========================================================================
-    // PLAYER INPUT PACKET
+    // INPUT + ROTATION POLLING
     // ========================================================================
 
-    public static void handleInputPacket(
+    /**
+     * Reads the controlling player's live input and camera angles.
+     *
+     * No mixin is needed: the server already stores the last input packet on
+     * ServerPlayer, and handleMovePlayer has already written the new rotation
+     * onto the player by the time END_SERVER_TICK runs. Polling here is
+     * therefore exactly as fresh as a HEAD injection into the packet handlers.
+     */
+    private static void pollControls(
             ServerPlayer player,
-            ServerboundPlayerInputPacket packet
+            Possession possession
     ) {
-        Possession possession =
-                ACTIVE.get(player.getUUID());
-
-        if (possession == null) {
-            return;
-        }
-
-        Input input = packet.input();
+        Input input =
+                player.getLastClientInput();
 
         possession.setInput(
                 input.forward(),
@@ -107,53 +108,16 @@ public final class MindControlManager {
                 input.shift(),
                 input.sprint()
         );
-    }
 
-    // ========================================================================
-    // PLAYER ROTATION PACKET
-    // ========================================================================
-
-    public static void handleRotationPacket(
-            ServerPlayer player,
-            ServerboundMovePlayerPacket packet
-    ) {
-        Possession possession =
-                ACTIVE.get(player.getUUID());
-
-        if (possession == null) {
-            return;
-        }
-
-        /*
-         * Only process packets that actually contain a rotation.
-         */
-        if (!packet.hasRotation()) {
-            return;
-        }
-
-        /*
-         * getYRot/getXRot take the current value as a fallback.
-         */
         float yaw =
-                packet.getYRot(
-                        possession.yaw()
-                );
+                player.getYRot();
 
         float pitch =
-                packet.getXRot(
-                        possession.pitch()
+                Mth.clamp(
+                        player.getXRot(),
+                        -90.0F,
+                        90.0F
                 );
-
-        /*
-         * Clamp pitch.
-         */
-        pitch = Math.max(
-                -90.0F,
-                Math.min(
-                        90.0F,
-                        pitch
-                )
-        );
 
         possession.setRotation(
                 yaw,
@@ -161,12 +125,9 @@ public final class MindControlManager {
         );
 
         /*
-         * Also keep the server-side player rotation synchronized.
-         * This is useful because the spectator camera originates from
-         * this player's client.
+         * Keep the player's own head aligned, since the spectator camera
+         * originates from this player's client.
          */
-        player.setYRot(yaw);
-        player.setXRot(pitch);
         player.setYHeadRot(yaw);
     }
 
@@ -420,6 +381,17 @@ public final class MindControlManager {
     }
 
     // ========================================================================
+    // SHUTDOWN
+    // ========================================================================
+
+    /** Called from ServerLifecycleEvents.SERVER_STOPPED. */
+    public static void clearAll() {
+        AWAITING_TARGET.clear();
+        ACTIVE.clear();
+        POSSESSED_ENTITY_IDS.clear();
+    }
+
+    // ========================================================================
     // SERVER TICK
     // ========================================================================
 
@@ -466,6 +438,14 @@ public final class MindControlManager {
              */
             player.setDeltaMovement(
                     Vec3.ZERO
+            );
+
+            /*
+             * Pull this tick's keyboard and mouse state off the player.
+             */
+            pollControls(
+                    player,
+                    possession
             );
 
             /*
