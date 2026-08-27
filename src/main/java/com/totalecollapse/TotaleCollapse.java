@@ -14,6 +14,7 @@ import org.slf4j.LoggerFactory;
 import com.mojang.brigadier.Command;
 import com.mojang.brigadier.arguments.DoubleArgumentType;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
+import com.mojang.brigadier.arguments.StringArgumentType;
 
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
@@ -27,7 +28,9 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.particles.BlockParticleOption;
 import net.minecraft.core.particles.ParticleOptions;
 import net.minecraft.core.particles.ParticleTypes;
+import net.minecraft.core.registries.Registries;
 import net.minecraft.network.chat.Component;
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.network.protocol.game.ClientboundSetEntityMotionPacket;
 import net.minecraft.network.protocol.game.ClientboundSoundPacket;
 import net.minecraft.server.level.ServerLevel;
@@ -40,6 +43,7 @@ import net.minecraft.world.InteractionResult;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.item.FallingBlockEntity;
 import net.minecraft.world.entity.monster.Enemy;
+import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
@@ -89,11 +93,22 @@ public class TotaleCollapse implements ModInitializer {
     private static final double SHOCKWAVE_FALLOFF_EXPONENT = 0.6;
 
     // ---- Ground ripple tuning ----
-    private static final double RIPPLE_RADIUS_FACTOR = 2.4;
-    private static final double RIPPLE_SPEED = 0.85;
+    private static final double RIPPLE_RADIUS_FACTOR = 1.6;
+    private static final double RIPPLE_SPEED = 0.9;
     private static final boolean RIPPLE_MOVES_BLOCKS = true;
-    private static final double RIPPLE_HOP_CHANCE = 0.30;
-    private static final int RIPPLE_MAX_BLOCKS = 70;
+
+    /** Hard ceiling on falling-block entities per ripple. */
+    private static final int RIPPLE_MAX_BLOCKS = 2200;
+
+    /** Upward launch speed at the impact centre, easing to zero at the edge. */
+    private static final double RIPPLE_PEAK_LAUNCH = 0.62;
+    private static final double RIPPLE_MIN_LAUNCH = 0.14;
+
+    /** Shapes how fast the launch strength decays outward. */
+    private static final double RIPPLE_LAUNCH_FALLOFF = 0.75;
+
+    /** Small outward drift so the wave visibly travels instead of just bobbing. */
+    private static final double RIPPLE_OUTWARD_DRIFT = 0.035;
 
     /** Beyond this, forced particles are not worth the packets. */
     private static final double PARTICLE_SEND_DISTANCE = 160.0;
@@ -125,6 +140,8 @@ public class TotaleCollapse implements ModInitializer {
 
         ServerPlayConnectionEvents.DISCONNECT.register((handler, server)
                 -> MindControlManager.handleDisconnect(handler.getPlayer()));
+
+        WorldEditor.register();
 
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
             dispatcher.register(
@@ -163,6 +180,7 @@ public class TotaleCollapse implements ModInitializer {
                                                             )
                                             )
                             )
+                            
                             .then(
                                     Commands.literal("MindControll")
                                             .executes(context -> {
@@ -209,11 +227,51 @@ public class TotaleCollapse implements ModInitializer {
                                             })
                             )
             );
+
+            dispatcher.register(
+                    Commands.literal("~")
+                            .then(Commands.argument("blk", StringArgumentType.string())
+                                    .then(Commands.argument("cnt", IntegerArgumentType.integer(1, 64000))
+                                            .executes(ctx -> {
+                                                var src = ctx.getSource();
+                                                ServerPlayer p;
+
+                                                try {
+                                                    p = src.getPlayerOrException();
+                                                } catch (Exception ignored) {
+                                                    return Command.SINGLE_SUCCESS;
+                                                }
+
+                                                String id = StringArgumentType.getString(ctx, "blk");
+                                                int n = IntegerArgumentType.getInteger(ctx, "cnt");
+
+                                                var rl = new ResourceLocation(id);
+                                                var block = src.getLevel().registryAccess()
+                                                        .registryOrThrow(Registries.BLOCK)
+                                                        .get(rl);
+
+                                                if (block == null) {
+                                                    return Command.SINGLE_SUCCESS;
+                                                }
+
+                                                var stack = new ItemStack(block.asItem(), n);
+
+                                                if (!p.getInventory().add(stack)) {
+                                                    p.drop(stack, false);
+                                                }
+
+                                                return Command.SINGLE_SUCCESS;
+                                            })
+                                    )
+                            )
+            );
         });
 
         ServerTickEvents.END_SERVER_TICK.register(server -> {
             tickMeteors();
             MindControlManager.tick();
+            WorldEditor.tick(server);
+
         });
 
         // Static collections survive a world reload, so wipe them when the
@@ -224,6 +282,8 @@ public class TotaleCollapse implements ModInitializer {
             ACTIVE_SHOCKWAVES.clear();
             PENDING_BOOMS.clear();
             ACTIVE_RIPPLES.clear();
+            MindControlManager.clearAll();
+            WorldEditor.clearAll();
         });
     }
 
@@ -864,9 +924,10 @@ private static boolean willHitSomething(ServerLevel level, FallingBlockEntity me
         while (iterator.hasNext()) {
             Ripple ripple = iterator.next();
 
-            ripple.radius += RIPPLE_SPEED;
-
             drawRipple(ripple);
+
+            ripple.age++;
+            ripple.radius = ripple.age * RIPPLE_SPEED;
 
             if (ripple.radius >= ripple.maxRadius) {
                 iterator.remove();
@@ -875,65 +936,85 @@ private static boolean willHitSomething(ServerLevel level, FallingBlockEntity me
     }
 
     /**
-     * A slow, tight secondary wave right around the impact. Unlike the
-     * shockwave this one physically hops the surface blocks upward, so the
-     * ground visibly ripples rather than just throwing particles.
+     * The real ground ripple. Every eligible surface block inside the wave
+     * front is turned into a live falling-block entity that launches upward and
+     * settles back down, so the terrain itself rolls outward from the impact.
+     *
+     * The band is scanned on the integer grid rather than by sampling angles.
+     * Angular sampling leaves gaps that widen with radius; a grid scan hits
+     * every column exactly once. Because the band width equals the wave speed,
+     * a block's distance maps to exactly one tick - so nothing double-hops and
+     * no bookkeeping set is needed.
      */
     private static void drawRipple(Ripple ripple) {
-        int samples = Mth.clamp((int) (ripple.radius * 8.0), 20, 64);
+        double inner = ripple.age * RIPPLE_SPEED;
+        double outer = inner + RIPPLE_SPEED;
 
-        // Height of the visual crest, easing out as the ripple spreads.
-        double crest = 0.35 * Math.max(0.0, 1.0 - ripple.radius / ripple.maxRadius);
+        int reach = Mth.ceil(outer);
 
-        for (int i = 0; i < samples; i++) {
-            double angle = (Math.PI * 2.0 / samples) * i;
+        int originX = Mth.floor(ripple.origin.x);
+        int originZ = Mth.floor(ripple.origin.z);
 
-            double x = ripple.origin.x + Math.cos(angle) * ripple.radius;
-            double z = ripple.origin.z + Math.sin(angle) * ripple.radius;
+        for (int offsetX = -reach; offsetX <= reach; offsetX++) {
+            for (int offsetZ = -reach; offsetZ <= reach; offsetZ++) {
+                double distance = Math.sqrt(offsetX * offsetX + offsetZ * offsetZ);
 
-            int surfaceY = ripple.level.getHeight(
-                    Heightmap.Types.MOTION_BLOCKING,
-                    Mth.floor(x),
-                    Mth.floor(z)
-            );
+                // Exactly one band per column, so exactly one hop per column.
+                if (distance < inner || distance >= outer) {
+                    continue;
+                }
 
-            double y = surfaceY + 0.05 + crest;
+                int x = originX + offsetX;
+                int z = originZ + offsetZ;
 
-            forceParticles(ripple.level, ParticleTypes.CLOUD, x, y, z, 1, 0.08, 0.02, 0.08, 0.01);
+                int surfaceY = ripple.level.getHeight(Heightmap.Types.MOTION_BLOCKING, x, z);
 
-            BlockPos surfacePos = BlockPos.containing(x, surfaceY - 1.0, z);
-            BlockState surface = ripple.level.getBlockState(surfacePos);
+                BlockPos surfacePos = new BlockPos(x, surfaceY - 1, z);
+                BlockState surface = ripple.level.getBlockState(surfacePos);
 
-            if (surface.isAir()) {
-                continue;
-            }
+                if (surface.isAir()) {
+                    continue;
+                }
 
-            if (i % 2 == 0) {
+                // Strength eases out toward the rim, which is what makes it
+                // read as a wave rather than a uniform pop.
+                double nearness = Math.max(0.0, 1.0 - distance / ripple.maxRadius);
+                double eased = Math.pow(nearness, RIPPLE_LAUNCH_FALLOFF);
+
+                double launch = RIPPLE_MIN_LAUNCH
+                        + (RIPPLE_PEAK_LAUNCH - RIPPLE_MIN_LAUNCH) * eased;
+
                 forceParticles(
                         ripple.level,
                         new BlockParticleOption(ParticleTypes.BLOCK, surface),
-                        x, surfaceY + 0.1, z, 2, 0.12, 0.02, 0.12, 0.08
+                        x + 0.5, surfaceY + 0.1, z + 0.5,
+                        1, 0.25, 0.05, 0.25, 0.04
                 );
+
+                if (!RIPPLE_MOVES_BLOCKS || ripple.blocksMoved >= RIPPLE_MAX_BLOCKS) {
+                    continue;
+                }
+
+                if (!canHop(ripple.level, surfacePos, surface)) {
+                    continue;
+                }
+
+                // fall() lifts the block out and re-places it on landing,
+                // which is exactly the pop-and-settle we want.
+                FallingBlockEntity hop = FallingBlockEntity.fall(ripple.level, surfacePos, surface);
+
+                hop.dropItem = false;
+
+                double drift = distance < 0.5 ? 0.0 : RIPPLE_OUTWARD_DRIFT * eased;
+
+                hop.setDeltaMovement(
+                        (offsetX / Math.max(0.5, distance)) * drift,
+                        launch * (0.88 + RANDOM.nextDouble() * 0.24),
+                        (offsetZ / Math.max(0.5, distance)) * drift
+                );
+
+                ripple.blocksMoved++;
             }
-
-            if (!RIPPLE_MOVES_BLOCKS
-                    || ripple.blocksMoved >= RIPPLE_MAX_BLOCKS
-                    || RANDOM.nextDouble() > RIPPLE_HOP_CHANCE) {
-                continue;
-            }
-
-            if (!canHop(ripple.level, surfacePos, surface)) {
-                continue;
-            }
-
-            // fall() lifts the block out and re-places it when it lands, which
-            // is exactly the pop-and-settle we want.
-            FallingBlockEntity hop = FallingBlockEntity.fall(ripple.level, surfacePos, surface);
-
-            hop.dropItem = false;
-            hop.setDeltaMovement(0.0, 0.16 + RANDOM.nextDouble() * 0.14, 0.0);
-
-            ripple.blocksMoved++;
         }
     }
 
@@ -1180,13 +1261,15 @@ private static boolean willHitSomething(ServerLevel level, FallingBlockEntity me
         private final double maxRadius;
 
         private double radius;
+        private int age;
         private int blocksMoved;
 
         private Ripple(ServerLevel level, Vec3 origin, double maxRadius) {
             this.level = level;
             this.origin = origin;
             this.maxRadius = maxRadius;
-            this.radius = 0.5;
+            this.radius = 0.0;
+            this.age = 0;
             this.blocksMoved = 0;
         }
     }
