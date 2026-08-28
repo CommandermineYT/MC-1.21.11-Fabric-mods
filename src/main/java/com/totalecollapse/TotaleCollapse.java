@@ -15,6 +15,11 @@ import com.mojang.brigadier.Command;
 import com.mojang.brigadier.arguments.DoubleArgumentType;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
+import com.totalecollapse.content.ModItemGroups;
+import com.totalecollapse.content.ModOres;
+import com.totalecollapse.content.ModToolBehaviour;
+import com.totalecollapse.content.ModTools;
+import com.totalecollapse.content.ModWorldgen;
 
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
@@ -123,7 +128,14 @@ public class TotaleCollapse implements ModInitializer {
 
     @Override
     public void onInitialize() {
-        UseEntityCallback.EVENT.register((player, world, hand, entity, hitResult) -> {
+
+         ModOres.init();
+         ModTools.init();            // ADD
+         ModItemGroups.init();
+         ModToolBehaviour.init();    // ADD
+         ModWorldgen.init();
+         StackItems.load();
+         UseEntityCallback.EVENT.register((player, world, hand, entity, hitResult) -> {
             if (world.isClientSide() || hand != InteractionHand.MAIN_HAND) {
                 return InteractionResult.PASS;
             }
