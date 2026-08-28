@@ -1,6 +1,0 @@
-{
-  "parent": "minecraft:block/cube_all",
-  "textures": {
-    "all": "totale-collapse:block/deepslate_aetherium_ore"
-  }
-}
