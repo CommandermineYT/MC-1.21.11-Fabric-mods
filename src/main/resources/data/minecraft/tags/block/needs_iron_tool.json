@@ -1,0 +1,11 @@
+{
+  "replace": false,
+  "values": [
+    "totale-collapse:mithril_ore",
+    "totale-collapse:deepslate_mithril_ore",
+    "totale-collapse:mithril_block",
+    "totale-collapse:orichalcum_ore",
+    "totale-collapse:deepslate_orichalcum_ore",
+    "totale-collapse:orichalcum_block"
+  ]
+}
