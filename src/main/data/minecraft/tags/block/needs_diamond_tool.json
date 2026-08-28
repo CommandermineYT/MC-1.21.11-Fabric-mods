@@ -1,0 +1,11 @@
+{
+  "replace": false,
+  "values": [
+    "totale-collapse:adamantite_ore",
+    "totale-collapse:deepslate_adamantite_ore",
+    "totale-collapse:adamantite_block",
+    "totale-collapse:aetherium_ore",
+    "totale-collapse:deepslate_aetherium_ore",
+    "totale-collapse:aetherium_block"
+  ]
+}

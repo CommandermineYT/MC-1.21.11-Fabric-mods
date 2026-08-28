@@ -1,0 +1,17 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "category": "equipment",
+  "key": {
+    "M": "totale-collapse:adamantite_ingot",
+    "S": "minecraft:stick"
+  },
+  "pattern": [
+    "MM ",
+    " S ",
+    " S "
+  ],
+  "result": {
+    "count": 1,
+    "id": "totale-collapse:adamantite_hoe"
+  }
+}
