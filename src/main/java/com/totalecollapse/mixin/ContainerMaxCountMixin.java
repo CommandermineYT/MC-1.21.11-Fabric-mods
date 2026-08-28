@@ -20,8 +20,8 @@ import net.minecraft.world.Container;
 @Mixin(Container.class)
 public interface ContainerMaxCountMixin {
 
-    @Inject(method = "getMaxStackSize()I", at = @At("RETURN"), cancellable = true)
-    private void totalecollapse$raiseContainerLimit(CallbackInfoReturnable<Integer> callback) {
+    @Inject(method = "getMaxStackSize", at = @At("RETURN"), cancellable = true, remap = false)
+    default void totalecollapse$raiseContainerLimit(CallbackInfoReturnable<Integer> callback) {
         int vanilla = callback.getReturnValueI();
         int raised = StackItems.slotLimit(vanilla);
 

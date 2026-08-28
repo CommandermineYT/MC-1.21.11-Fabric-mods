@@ -30,7 +30,7 @@ import net.minecraft.core.particles.ParticleOptions;
 import net.minecraft.core.particles.ParticleTypes;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.network.chat.Component;
-import net.minecraft.resources.ResourceLocation;
+import net.minecraft.resources.Identifier;
 import net.minecraft.network.protocol.game.ClientboundSetEntityMotionPacket;
 import net.minecraft.network.protocol.game.ClientboundSoundPacket;
 import net.minecraft.server.level.ServerLevel;
@@ -238,17 +238,17 @@ public class TotaleCollapse implements ModInitializer {
 
                                                 try {
                                                     p = src.getPlayerOrException();
-                                                } catch (Exception ignored) {
+                                                } catch (com.mojang.brigadier.exceptions.CommandSyntaxException ignored) {
                                                     return Command.SINGLE_SUCCESS;
                                                 }
 
                                                 String id = StringArgumentType.getString(ctx, "blk");
                                                 int n = IntegerArgumentType.getInteger(ctx, "cnt");
 
-                                                var rl = new ResourceLocation(id);
+                                                var rl = Identifier.parse(id);
                                                 var block = src.getLevel().registryAccess()
-                                                        .registryOrThrow(Registries.BLOCK)
-                                                        .get(rl);
+                                                        .lookupOrThrow(Registries.BLOCK)
+                                                        .getValue(rl);
 
                                                 if (block == null) {
                                                     return Command.SINGLE_SUCCESS;

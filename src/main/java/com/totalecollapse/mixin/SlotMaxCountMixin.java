@@ -29,7 +29,7 @@ public abstract class SlotMaxCountMixin {
     @Shadow
     public abstract int getContainerSlot();
 
-    @Inject(method = "getMaxStackSize", at = @At("RETURN"), cancellable = true)
+    @Inject(method = "getMaxStackSize", at = @At("RETURN"), cancellable = true, remap = false)
     private void totalecollapse$raiseSlotLimit(CallbackInfoReturnable<Integer> callback) {
         if (StackItems.isRestrictedSlot(this.container, this.getContainerSlot())) {
             return;

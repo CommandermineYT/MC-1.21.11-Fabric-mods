@@ -18,7 +18,7 @@ import net.minecraft.world.item.ItemStack;
 @Mixin(ItemStack.class)
 public class ItemStackMaxCountMixin {
 
-    @Inject(method = "getMaxStackSize", at = @At("RETURN"), cancellable = true)
+    @Inject(method = "getMaxStackSize()I", at = @At("RETURN"), cancellable = true, remap = false)
     private void totalecollapse$raiseStackLimit(CallbackInfoReturnable<Integer> callback) {
         int vanilla = callback.getReturnValueI();
         int raised = StackItems.limitFor((ItemStack) (Object) this, vanilla);
